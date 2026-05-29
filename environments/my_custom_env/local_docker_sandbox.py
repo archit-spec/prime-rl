@@ -57,6 +57,26 @@ class _LocalSandbox:
     status: str = "RUNNING"
 
 
+@dataclass(slots=True)
+class _BackgroundJob:
+    """Handle returned by start_background_job (mirrors prime_sandboxes.BackgroundJob)."""
+    job_id: str
+    sandbox_id: str
+    stdout_log_file: str
+    stderr_log_file: str
+    exit_file: str
+
+
+@dataclass(slots=True)
+class _BackgroundJobStatus:
+    """Result of get_background_job (mirrors prime_sandboxes.BackgroundJobStatus)."""
+    job_id: str
+    completed: bool
+    exit_code: int | None = None
+    stdout: str | None = None
+    stderr: str | None = None
+
+
 @dataclass
 class LocalDockerSandboxClient:
     """Runs sandboxes as local Docker containers.
@@ -182,6 +202,83 @@ class LocalDockerSandboxClient:
     ) -> _CmdResult:
         # Local impl: just run it synchronously (callers await the result anyway).
         return await self.execute_command(sandbox_id, command, working_dir, env, timeout)
+
+    async def start_background_job(
+        self,
+        sandbox_id: str,
+        command: str,
+        working_dir: str | None = None,
+        env: dict | None = None,
+    ) -> _BackgroundJob:
+        """Start a long-running command detached inside the container.
+
+        The opencode harness (CliAgentEnv) runs the agent via this method, not
+        execute_command — it returns immediately with a handle and polls
+        get_background_job() until the agent exits. Mirrors
+        prime_sandboxes.AsyncSandboxClient.start_background_job: the command's
+        stdout/stderr/exit-code are captured to files in /tmp so the poller can
+        read them back. (Missing this method was why every rollout raised
+        SandboxError->AttributeError → empty trajectory → zero_advantage filter
+        → step-0 eviction.)
+        """
+        job_id = uuid.uuid4().hex[:8]
+        stdout_log = f"/tmp/job_{job_id}.stdout.log"
+        stderr_log = f"/tmp/job_{job_id}.stderr.log"
+        exit_file = f"/tmp/job_{job_id}.exit"
+
+        env_prefix = ""
+        if env:
+            env_prefix = "; ".join(f"export {k}={shlex.quote(str(v))}" for k, v in env.items())
+            if env_prefix:
+                env_prefix += "; "
+        dir_prefix = f"cd {shlex.quote(working_dir)} && " if working_dir else ""
+        body = f"{env_prefix}{dir_prefix}{command}"
+        # Subshell so an `exit` in the command doesn't skip the exit-code capture.
+        sh = (
+            f"({body}) > {shlex.quote(stdout_log)} 2> {shlex.quote(stderr_log)}; "
+            f"echo $? > {shlex.quote(exit_file)}"
+        )
+        bg = f"nohup sh -c {shlex.quote(sh)} < /dev/null > /dev/null 2>&1 &"
+        await self.execute_command(sandbox_id, bg, timeout=15)
+        return _BackgroundJob(
+            job_id=job_id,
+            sandbox_id=sandbox_id,
+            stdout_log_file=stdout_log,
+            stderr_log_file=stderr_log,
+            exit_file=exit_file,
+        )
+
+    async def get_background_job(
+        self,
+        sandbox_id: str,
+        job: _BackgroundJob,
+        timeout: int | None = None,
+    ) -> _BackgroundJobStatus:
+        """Poll a background job: not completed until the exit file has an int."""
+        exit_res = await self.execute_command(
+            sandbox_id, f"cat {shlex.quote(job.exit_file)} 2>/dev/null", timeout=30
+        )
+        exit_content = (exit_res.stdout or "").strip()
+        if not exit_content:
+            return _BackgroundJobStatus(job_id=job.job_id, completed=False)
+        try:
+            exit_code = int(exit_content)
+        except ValueError:
+            return _BackgroundJobStatus(job_id=job.job_id, completed=False)
+
+        out = await self.execute_command(
+            sandbox_id, f"cat {shlex.quote(job.stdout_log_file)} 2>/dev/null", timeout=60
+        )
+        err = await self.execute_command(
+            sandbox_id, f"cat {shlex.quote(job.stderr_log_file)} 2>/dev/null", timeout=60
+        )
+        return _BackgroundJobStatus(
+            job_id=job.job_id,
+            completed=True,
+            exit_code=exit_code,
+            stdout=out.stdout or "",
+            stderr=err.stderr or err.stdout or "",
+        )
 
     # -- files --------------------------------------------------------------
 

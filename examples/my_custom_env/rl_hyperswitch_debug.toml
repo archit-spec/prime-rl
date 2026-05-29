@@ -1,0 +1,53 @@
+max_steps = 5
+seq_len = 4096
+
+[deployment]
+num_train_gpus = 2
+num_infer_gpus = 2
+
+# Small, fast-loading policy model. GLM-4.7-Flash (30B MoE) takes ~60-90s to
+# load on TP=4; the orchestrator can start generating before it's ready, every
+# rollout comes back empty during warmup, zero_advantage filters all of them,
+# and MAX_EMPTY_BATCH_ATTEMPTS=3 evicts at step 0. Qwen3-4B loads in ~20s so
+# inference is ready before the first batch — this proves the env reward loop
+# end to end. Switch back to GLM (rl_hyperswitch.toml) once the loop is green.
+[model]
+name = "Qwen/Qwen3-4B"
+
+[wandb]
+project = "hyperswitch-rl"
+name = "qwen3-4b-debug-compile-gated"
+
+[orchestrator]
+batch_size = 16
+rollouts_per_example = 8
+
+[orchestrator.train.sampling]
+max_completion_tokens = 2048
+temperature = 0.7
+
+[[orchestrator.train.env]]
+id = "my-custom-env"
+
+[orchestrator.train.env.args]
+num_train_examples = 64
+num_eval_examples = 8
+curriculum_level = 0
+max_turns = 15
+
+[trainer.model]
+attn = "flash_attention_2"
+optimization_dtype = "bfloat16"
+reduce_dtype = "bfloat16"
+dp_replicate = 2
+
+[trainer.optim]
+lr = 1e-6
+
+[inference]
+
+[inference.model]
+dtype = "bfloat16"
+
+[inference.parallel]
+tp = 2
