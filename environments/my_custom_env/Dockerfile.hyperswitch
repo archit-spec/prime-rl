@@ -1,0 +1,22 @@
+FROM rust:1.85
+
+# Install dependencies needed at setup time
+RUN apt-get update -qq \
+    && apt-get install -y -qq git curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pre-clone the hyperswitch repo (blobless, so it's smaller but complete enough
+# that any commit can be checked out later with `git fetch + git checkout`)
+RUN git clone --filter=blob:none --no-checkout \
+    https://github.com/juspay/hyperswitch.git /app \
+    && cd /app \
+    && git checkout main
+
+# Pre-fetch all Cargo dependencies so the registry cache is warm.
+# This dramatically speeds up `cargo check` and `cargo test` in the sandbox.
+WORKDIR /app
+RUN cargo fetch 2>&1 || true
+
+# Pre-build the workspace in check-only mode to populate incremental caches.
+# We use `|| true` because some feature flags / env vars may not be set yet.
+RUN cargo check --workspace 2>&1 || true

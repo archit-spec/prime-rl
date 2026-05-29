@@ -1,0 +1,18 @@
+max_steps = 100
+
+[model]
+name = "google/gemma-4-26B-A4B-it"
+
+[wandb]
+project = "my-custom-env"
+name = "sft-run"
+
+[data]
+name = "willcb/R1-reverse-wikipedia-paragraphs-v1-1000"
+seq_len = 2048
+batch_size = 16
+
+[optim]
+lr = 2e-5
+
+[ckpt]

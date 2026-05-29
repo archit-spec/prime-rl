@@ -1,0 +1,58 @@
+max_steps = 100
+seq_len = 4096
+
+[deployment]
+num_train_gpus = 4
+num_infer_gpus = 4
+
+[model]
+name = "/data/GLM-4.7-Flash"
+
+[wandb]
+project = "hyperswitch-rl"
+name = "glm47-flash-compile-gated-structural"
+
+[orchestrator]
+# batch_size is TOTAL rollouts/step and must be divisible by
+# rollouts_per_example. 16 / 8 = 2 unique examples per step — small, so few
+# concurrent Docker sandboxes and a cheap step 0, while still giving 2 groups
+# (advantage needs intra-group reward variance; 1 group is riskier).
+batch_size = 16
+rollouts_per_example = 8
+
+[orchestrator.train.sampling]
+max_completion_tokens = 2048
+temperature = 0.7
+
+[[orchestrator.train.env]]
+id = "my-custom-env"
+
+[orchestrator.train.env.args]
+num_train_examples = 256
+num_eval_examples = 32
+curriculum_level = 0
+# Strict, small turn budget: force the agent to edit fast so rollouts
+# produce a non-empty diff (empty diff -> reward 0 -> zero-advantage ->
+# whole group filtered -> orchestrator eviction). See findings_pr11372.md.
+max_turns = 15
+
+# GLM-4.7-Flash is model_type=glm4_moe_lite (native in transformers 5.5,
+# NOT in prime-rl's custom glm4_moe mapping), so impl=auto resolves to the
+# HF path. Expert-parallel (ep) only engages for custom-impl MoE modules, so
+# we omit it and let FSDP shard across the 4 train GPUs.
+[trainer.model]
+impl = "auto"
+attn = "flash_attention_2"
+optimization_dtype = "bfloat16"
+reduce_dtype = "bfloat16"
+
+[trainer.optim]
+lr = 1e-6
+
+[inference]
+
+[inference.model]
+dtype = "bfloat16"
+
+[inference.parallel]
+tp = 4

@@ -1,0 +1,43 @@
+max_steps = 100
+seq_len = 2048
+
+[deployment]
+num_train_gpus = 2
+num_infer_gpus = 2
+
+[model]
+name = "Qwen/Qwen3-4B"
+
+[wandb]
+project = "my-custom-env"
+name = "rl-run"
+
+[orchestrator]
+batch_size = 128
+rollouts_per_example = 8
+
+[orchestrator.train.sampling]
+max_completion_tokens = 1024
+temperature = 0.7
+
+[[orchestrator.train.env]]
+id = "reverse-text"
+
+[trainer.model]
+attn = "flash_attention_2"
+optimization_dtype = "bfloat16"
+reduce_dtype = "bfloat16"
+dp_replicate = 2
+
+[trainer.optim]
+lr = 3e-6
+
+[inference]
+
+[inference.model]
+dtype = "bfloat16"
+
+[inference.parallel]
+tp = 2
+
+[ckpt]
