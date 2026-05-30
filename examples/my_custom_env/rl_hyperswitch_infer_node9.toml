@@ -1,0 +1,14 @@
+output_dir = "outputs"
+
+[model]
+name = "Qwen/Qwen3-30B-A3B"
+dtype = "bfloat16"
+
+[server]
+port = 8000
+
+[parallel]
+tp = 4
+
+[vllm_extra]
+kv_cache_dtype = "fp8"

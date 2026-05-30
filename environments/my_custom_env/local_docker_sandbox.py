@@ -324,7 +324,7 @@ class LocalDockerSandboxClient:
         if sandbox is None:
             return {"status": "not_found"}
         await self._run(
-            ["docker", "rm", "-f", sandbox.container_name], timeout=120
+            ["docker", "rm", "-vf", sandbox.container_name], timeout=120
         )
         return {"status": "deleted"}
 
@@ -336,7 +336,7 @@ class LocalDockerSandboxClient:
         """Force-remove any leftover containers and shut the pool down."""
         for sandbox in list(self._containers.values()):
             subprocess.run(
-                ["docker", "rm", "-f", sandbox.container_name],
+                ["docker", "rm", "-vf", sandbox.container_name],
                 capture_output=True,
             )
         self._containers.clear()

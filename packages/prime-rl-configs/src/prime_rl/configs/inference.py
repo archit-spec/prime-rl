@@ -122,7 +122,7 @@ class WeightBroadcastConfig(BaseConfig):
 
 # Valid vLLM max_lora_rank values (from vllm/config/lora.py)
 # TODO: on newer vLLM, can import via `get_args(vllm.config.lora.MaxLoRARanks)`
-VALID_VLLM_LORA_RANKS = (8, 16, 32, 64, 128, 256, 320, 512)
+VALID_VLLM_LORA_RANKS = (1, 8, 16, 32, 64, 128, 256, 320, 512)
 
 # vLLM all2all backend options for expert-parallel deployments.
 All2AllBackend = Literal[
@@ -571,6 +571,10 @@ class InferenceConfig(BaseConfig):
         # Remove lora_target_modules if not set (vLLM doesn't accept None)
         if hasattr(namespace, "lora_target_modules") and namespace.lora_target_modules is None:
             delattr(namespace, "lora_target_modules")
+
+        # Remove max_lora_rank if not set (vLLM doesn't accept None)
+        if hasattr(namespace, "max_lora_rank") and namespace.max_lora_rank is None:
+            delattr(namespace, "max_lora_rank")
 
         # Remove rope_scaling if not set (vLLM doesn't accept None)
         if hasattr(namespace, "rope_scaling"):

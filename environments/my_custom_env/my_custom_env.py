@@ -52,6 +52,12 @@ from typing import Literal
 from datasets import Dataset
 
 logger = logging.getLogger("hyperswitch_env")
+logger.setLevel(logging.INFO)
+logger.propagate = True
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.INFO)
+    logger.addHandler(handler)
 import verifiers as vf
 from verifiers.envs.experimental.composable import (
     SandboxSpec,
@@ -502,7 +508,7 @@ class HyperswitchRubric(vf.Rubric):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.add_reward_func(self.score_rollout)
+        self.add_reward_func(self._compute_reward)
 
     @staticmethod
     def _touched_packages(agent_diff: str) -> set[str]:
@@ -593,7 +599,7 @@ class HyperswitchRubric(vf.Rubric):
         except Exception:
             return None
 
-    async def score_rollout(self, state, **kwargs) -> float:
+    async def _compute_reward(self, state, **kwargs) -> float:
         sandbox_client = state.get("sandbox_client")
         sandbox_id = state.get("sandbox_id")
         gold_patch = state.get("answer") or ""
@@ -606,13 +612,31 @@ class HyperswitchRubric(vf.Rubric):
             logger.warning("score_rollout: no sandbox client/id -> reward 0.0")
             return 0.0
 
+        # Stage everything first so the diff also captures NEW/untracked files
+        # the agent created — plain `git diff` only shows tracked modifications,
+        # which silently yields an empty diff (reward 0) when the agent's edits
+        # are new files. The sandbox is ephemeral, so touching the index is safe.
         diff_res = await sandbox_client.execute_command(
-            sandbox_id, "git diff", working_dir=WORKDIR
+            sandbox_id, "git add -A && git diff --cached HEAD", working_dir=WORKDIR
         )
         agent_diff = diff_res.stdout or ""
         logger.info("score_rollout: agent_diff len=%d", len(agent_diff))
         if not agent_diff.strip():
-            logger.warning("score_rollout: EMPTY agent diff -> reward 0.0")
+            # Dump the working-tree state so we can tell WHY the diff is empty:
+            # agent made no edits at all vs. edits landed somewhere unexpected
+            # vs. git status sees changes that `git diff` somehow didn't.
+            status_res = await sandbox_client.execute_command(
+                sandbox_id,
+                "echo '== git status =='; git status --porcelain; "
+                "echo '== HEAD =='; git rev-parse HEAD; "
+                "echo '== recent mtimes =='; find . -type f -newermt '-30 minutes' "
+                "-not -path './.git/*' 2>/dev/null | head -40",
+                working_dir=WORKDIR,
+            )
+            logger.warning(
+                "score_rollout: EMPTY agent diff -> reward 0.0\nWORKTREE STATE:\n%s\n%s",
+                status_res.stdout or "", status_res.stderr or "",
+            )
             return 0.0
 
         # ---- structural closeness to gold (dense, free) ----

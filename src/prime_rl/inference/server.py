@@ -10,6 +10,12 @@ def setup_vllm_env(config: InferenceConfig):
     # spawn is more robust in vLLM nightlies and Qwen3-VL (fork can deadlock with multithreaded processes)
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
+    # Large MoE models (e.g. GLM-4.7-Flash, 62.5GB on TP=4) take longer than
+    # vLLM's default 600s engine-core startup timeout to load weights + capture
+    # CUDA graphs. Exceeding it kills the engine core, so the server never
+    # serves /health and every rollout comes back empty. Bump to 30 min.
+    os.environ.setdefault("VLLM_ENGINE_READY_TIMEOUT_S", "1800")
+
     if config.enable_lora:
         os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
 

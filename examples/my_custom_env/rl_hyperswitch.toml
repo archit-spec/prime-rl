@@ -1,12 +1,17 @@
 max_steps = 100
-seq_len = 4096
+# GLM-4.7-Flash has a 154880-token vocab. The vanilla LM head materializes a
+# full [seq, vocab] fp32 logits tensor at loss time (seq_len * 154880 * 4 B),
+# which OOMs the trainer backward. We enable the fused/chunked LM head below
+# (fused_lm_head_token_chunk_size), so peak logits memory is chunk_size * vocab
+# regardless of seq_len — that lets us keep a long context here.
+seq_len = 102400
 
 [deployment]
 num_train_gpus = 4
 num_infer_gpus = 4
 
 [model]
-name = "/data/GLM-4.7-Flash"
+name = "zai-org/GLM-4.7-Flash"
 
 [wandb]
 project = "hyperswitch-rl"
@@ -14,14 +19,13 @@ name = "glm47-flash-compile-gated-structural"
 
 [orchestrator]
 # batch_size is TOTAL rollouts/step and must be divisible by
-# rollouts_per_example. 16 / 8 = 2 unique examples per step — small, so few
-# concurrent Docker sandboxes and a cheap step 0, while still giving 2 groups
-# (advantage needs intra-group reward variance; 1 group is riskier).
-batch_size = 16
+# rollouts_per_example. 8 / 8 = 1 unique example/step; with dp_shard=4 that is
+# ~2 sequences per GPU at the loss phase, keeping the fp32 logits bounded.
+batch_size = 8
 rollouts_per_example = 8
 
 [orchestrator.train.sampling]
-max_completion_tokens = 2048
+max_completion_tokens = 4096
 temperature = 0.7
 
 [[orchestrator.train.env]]
@@ -31,10 +35,9 @@ id = "my-custom-env"
 num_train_examples = 256
 num_eval_examples = 32
 curriculum_level = 0
-# Strict, small turn budget: force the agent to edit fast so rollouts
-# produce a non-empty diff (empty diff -> reward 0 -> zero-advantage ->
-# whole group filtered -> orchestrator eviction). See findings_pr11372.md.
-max_turns = 15
+# Env works end-to-end (vf-eval reward 0.127). Give the agent more turns now
+# to explore + iterate (cargo check between edits) for higher-quality diffs.
+max_turns = 80
 
 # GLM-4.7-Flash is model_type=glm4_moe_lite (native in transformers 5.5,
 # NOT in prime-rl's custom glm4_moe mapping), so impl=auto resolves to the
@@ -45,6 +48,23 @@ impl = "auto"
 attn = "flash_attention_2"
 optimization_dtype = "bfloat16"
 reduce_dtype = "bfloat16"
+# cp=4 forces dp_shard=1 (world_size/cp = 4/4), so each GPU holds the FULL
+# model + optimizer states (~7x weights) and OOMs before any activations.
+# Use cp=1 so dp_shard auto-resolves to 4, sharding weights+optimizer states
+# across all 4 train GPUs.
+cp = 1
+# Chunked/fused LM head: computes logprobs in token chunks so the loss phase
+# never materializes the full [seq, vocab] logits. Peak logits memory becomes
+# chunk_size * vocab (8192 * 154880 * 4 B ~= 5 GB) instead of seq_len * vocab
+# (~50 GB at 80k). This is the actual fix for the trainer backward OOM and
+# works on the HF/auto path too (inject_prime_lm_head runs for all impls).
+fused_lm_head_token_chunk_size = "auto"
+
+# Full activation checkpointing: recompute activations on the backward pass
+# instead of storing them. Without CP sequence sharding, each GPU processes
+# the full seq_len for every layer, so this is needed to fit activations.
+[trainer.model.ac]
+mode = "full"
 
 [trainer.optim]
 lr = 1e-6
@@ -56,3 +76,7 @@ dtype = "bfloat16"
 
 [inference.parallel]
 tp = 4
+
+# FP8 KV cache halves KV-cache memory, giving more room for the long context.
+[inference.vllm_extra]
+kv_cache_dtype = "fp8"
