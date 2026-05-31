@@ -28,7 +28,9 @@ max_inflight_rollouts = 64
 
 [orchestrator.train.sampling]
 max_completion_tokens = 4096
-temperature = 0.7
+# Higher temperature -> more diverse outcomes within each 8-rollout group ->
+# more within-group reward variance -> bigger GRPO advantages -> bigger grad.
+temperature = 1.0
 
 [[orchestrator.train.env]]
 id = "my-custom-env"
@@ -79,7 +81,9 @@ alpha = 64
 mode = "full"
 
 [trainer.optim]
-lr = 1e-6
+# 1e-6 was very conservative — with small (normalized-advantage, LoRA) grad
+# norms the updates were micro. 5e-6 makes each step actually move the policy.
+lr = 5e-6
 
 [inference]
 

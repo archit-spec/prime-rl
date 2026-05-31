@@ -1096,9 +1096,9 @@ class HyperswitchTaskSet(SandboxTaskSet):
     def get_sandbox_spec(self, info: dict) -> SandboxSpec:
         return SandboxSpec(
             image=self.SANDBOX_IMAGE,
-            cpu_cores=8,
-            memory_gb=16,
-            disk_size_gb=20,
+            cpu_cores=64,
+            memory_gb=128,
+            disk_size_gb=100,
         )
 
     def get_rubric(self) -> vf.Rubric:
