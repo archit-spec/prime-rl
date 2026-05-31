@@ -632,7 +632,7 @@ class HyperswitchRubric(vf.Rubric):
     compile term (not a multiplicative gate).
 
         reward = (1 - COMPILE_WEIGHT)·quality  +  COMPILE_WEIGHT·compiles
-        quality = 0.55·structural + 0.15·style + 0.30·judge
+        quality = 0.60·structural + 0.10·style + 0.30·judge
         structural = 0.30·file_targeting_F1 + 0.70·ast    (ast = location+reference)
 
     Compile is ADDITIVE so it doesn't squash the gold-anchored structural
@@ -642,16 +642,23 @@ class HyperswitchRubric(vf.Rubric):
     scale while still rewarding code that actually builds — an orthogonal,
     solution-agnostic signal the gold-diff comparison can't provide.
 
-    The LLM judge is optional: when no API key is configured it returns
-    None and the remaining (structural+style) weights are renormalized, so
-    the env runs fully offline.  `cargo test` F2P/P2P is NOT in the dense
-    reward — it is a coarse oracle blind to structural quality
-    (findings_pr11372.md §2.4) and belongs in a periodic eval gate.
+    The judge carries low weight (0.15): it's a noisy LLM signal that in
+    practice fails to emit parseable JSON the majority of the time, so we lean
+    on the deterministic gold-anchored structural signal and treat the judge as
+    a minor tie-breaker. When it returns None (offline or parse failure) the
+    structural+style weights renormalize, so the env runs fully offline.
+    `cargo test` F2P/P2P is NOT in the dense reward — it is a coarse oracle
+    blind to structural quality (findings_pr11372.md §2.4) and belongs in a
+    periodic eval gate.
     """
 
-    # Weights for the quality term.
-    W_STRUCT = 0.55
-    W_STYLE = 0.15
+    # Weights for the quality term. Structural (gold-anchored, deterministic,
+    # high-variance → learnable gradient) stays primary. The judge — now
+    # reliable (forced JSON) and focused on the orthogonal correctness +
+    # completeness axes (the real target; credits correct-but-different) — gets
+    # a meaningful share. Style is the weakest signal (6-pattern regex), trimmed.
+    W_STRUCT = 0.60
+    W_STYLE = 0.10
     W_JUDGE = 0.30
     # Additive compile term: this fraction of the reward is "does it build",
     # the rest is quality. Additive (not multiplicative) so structural variance
@@ -671,14 +678,16 @@ class HyperswitchRubric(vf.Rubric):
     AST_LOCATION_WEIGHT = 0.5
     AST_REFERENCE_WEIGHT = 0.5
 
-    async def _ast_item_f1(self, client, sandbox_id, gold_diff: str, agent_diff: str) -> tuple[float | None, float | None, float | None]:
-        """Returns (blended, location_f1, reference_f1).
+    async def _ast_item_f1(self, client, sandbox_id, gold_diff: str, agent_diff: str) -> tuple[float | None, float | None, float | None, dict]:
+        """Returns (blended, location_f1, reference_f1, detail).
 
         location_f1: maps each diff's changed base-line numbers onto the FULL
           base-file tree-sitter AST (`git show HEAD:<f>`, HEAD == base_commit)
           and F1s the enclosing Rust items.
         reference_f1: F1 over the symbols (types/fields/methods, to depth) the
           ADDED code references.
+        detail: the underlying item/symbol sets, reused to build the compact
+          structural summary handed to the judge.
         Each component is None when its gold side is empty; blended is None only
         when BOTH are (caller then falls back to file-level — no spurious 1.0).
         """
@@ -724,7 +733,13 @@ class HyperswitchRubric(vf.Rubric):
         else:
             wsum = sum(w for w, _ in parts)
             blended = sum(w * v for w, v in parts) / wsum
-        return blended, location, reference
+        # detail feeds the judge a compact structural diagnosis instead of the
+        # raw gold diff — same facts, far fewer tokens.
+        detail = {
+            "gold_items": gold_items, "agent_items": agent_items,
+            "gold_refs": gold_refs, "agent_refs": agent_refs,
+        }
+        return blended, location, reference, detail
 
     @staticmethod
     def _touched_packages(agent_diff: str) -> set[str]:
@@ -755,79 +770,74 @@ class HyperswitchRubric(vf.Rubric):
         return True, ""
 
     _JUDGE_SYSTEM = (
-        "You are a strict, evidence-driven code reviewer scoring a Rust patch on anchored "
-        "rubrics. The reference patch is ONE valid solution among many — different but "
-        "equivalent approaches MUST NOT be penalised. Only penalise things that are wrong, "
-        "broken, missing, or violate documented conventions.\n\n"
-        "CRITICAL — anchored scoring: for each dimension pick the BAND whose description "
-        "matches the evidence, then choose the exact integer score within that band's range. "
-        "Do NOT freelance scores or pick bands that don't match. Each band name and its "
-        "integer range are given in the rubric. Provide one-sentence reasoning per dimension "
-        "explaining which evidence drove your band choice.\n\n"
-        "Output a single JSON object — no prose outside it, no markdown fences."
+        "You are a strict Rust code reviewer. Judge ONLY two things the "
+        "deterministic checks can't: correctness (does the patch's logic "
+        "actually implement the task?) and completeness (are all requirements "
+        "addressed?). Style, conventions and diff-tidiness are scored elsewhere "
+        "— ignore them. The reference is ONE valid solution; a correct but "
+        "DIFFERENT approach must score full marks. Output one JSON object only."
     )
 
+    # Compact: task + the agent patch + a precomputed AST diagnosis vs the
+    # reference (so we don't ship the whole gold diff into context). Two
+    # 0-10 dimensions only.
     _JUDGE_USER_TEMPLATE = """\
 ## Task
 {task}
 
-## Reference patch (ONE valid solution — different valid approaches are equally good)
-```diff
-{expected_diff}
-```
-
-## Agent patch (to evaluate)
+## Patch to evaluate
 ```diff
 {agent_diff}
 ```
 
-## Anchored rubric
+## Structural analysis (AST diff vs the reference solution; for context only)
+{ast_summary}{compile_line}
 
-### 1. correctness
-| Band | Score | Criteria |
-|------|-------|----------|
-| BROKEN | 0-1 | Empty diff, won't compile, or inverted logic. |
-| FUNDAMENTALLY_WRONG | 2-3 | Compiles but core logic wrong. |
-| PARTIAL_BUGS | 4-5 | Compiles, partially correct, definite logic bug. |
-| MOSTLY_CORRECT | 6-7 | Mostly correct, edge cases wrong. |
-| CORRECT | 8-9 | Correct for all stated cases. |
-| PERFECT | 10 | Correct AND matches reference behaviour. |
+## Score 0-10 each
+- correctness: 0-1 won't build / inverted logic; 2-3 builds, core logic wrong;
+  4-5 partially correct w/ a real bug; 6-7 mostly correct, edge cases off;
+  8-9 correct for all stated cases; 10 correct AND equivalent to reference.
+- completeness: 0-1 none; 2-3 ≤25%; 4-5 ~50%; 6-7 ~75%; 8-9 75-99%; 10 all
+  requirements addressed.
 
-### 2. completeness
-| Band | Score | Criteria |
-|------|-------|----------|
-| NONE | 0-1 | 0% of requirements addressed. |
-| MINIMAL | 2-3 | ≤25% addressed. |
-| PARTIAL | 4-5 | 25-50% addressed. |
-| SUBSTANTIAL | 6-7 | 50-75% addressed. |
-| NEARLY_COMPLETE | 8-9 | 75-99% addressed. |
-| COMPLETE | 10 | 100% addressed. |
+Return ONLY: {{"correctness":{{"score":<int>}},"completeness":{{"score":<int>}}}}"""
 
-### 3. convention_adherence
-| Band | Score | Criteria |
-|------|-------|----------|
-| SEVERE | 0-1 | 4+ violations OR single absolute violation (unsafe/panic/unwrap). |
-| MULTIPLE | 2-3 | 3 violations. |
-| TWO_VIOLATIONS | 4-5 | 2 violations. |
-| ONE_VIOLATION | 6-7 | 1 violation. |
-| MINOR_LAPSES | 8-9 | Minor stylistic lapses, no documented convention broken. |
-| PERFECT | 10 | All conventions followed. |
+    _JUDGE_WEIGHTS = {"correctness": 0.6, "completeness": 0.4}
+    # Give the judge enough context to assess completeness: the FULL task
+    # (= the agent's instruction) and a generous slice of the patch. The AST
+    # summary replaces the raw gold diff, which is where the big savings came
+    # from — so we can afford real task + patch context.
+    _JUDGE_MAX_TASK_CHARS = 3000
+    _JUDGE_MAX_DIFF_CHARS = 5000
 
-### 4. hygiene
-| Band | Score | Criteria |
-|------|-------|----------|
-| VERY_DIRTY | 0-1 | Spurious files, >50% whitespace churn, or >2 unrelated files. |
-| DIRTY | 2-3 | One spurious file OR significant unrelated changes. |
-| SOMEWHAT_DIRTY | 4-5 | Some unnecessary modifications. |
-| MOSTLY_CLEAN | 6-7 | Mostly focused, minor extraneous changes. |
-| CLEAN | 8-9 | Clean diff, scoped to task. |
-| MINIMAL | 10 | Minimal, perfectly scoped diff. |
+    # The judge endpoint caps concurrency; exceeding it makes calls fail. Cap
+    # in-flight judge requests with a process-global semaphore. Tested judges:
+    # minimax-m2 emits clean JSON (~45s); kimi reasoning models can't be made
+    # to stop thinking and never emit JSON on real prompts — don't use them.
+    JUDGE_CONCURRENCY = int(os.environ.get("JUDGE_CONCURRENCY", "5"))
+    _judge_sem: "asyncio.Semaphore | None" = None
 
-Return ONLY this JSON. No markdown fences, no prose outside it:
-{{"correctness":{{"band":"<BAND>","score":<int>}},"completeness":{{"band":"<BAND>","score":<int>}},"convention_adherence":{{"band":"<BAND>","score":<int>}},"hygiene":{{"band":"<BAND>","score":<int>}}}}"""
+    @classmethod
+    def _get_judge_sem(cls) -> "asyncio.Semaphore":
+        if cls._judge_sem is None:
+            cls._judge_sem = asyncio.Semaphore(cls.JUDGE_CONCURRENCY)
+        return cls._judge_sem
 
-    _JUDGE_WEIGHTS = {"correctness": 0.35, "completeness": 0.30, "convention_adherence": 0.20, "hygiene": 0.15}
-    _JUDGE_MAX_DIFF_CHARS = 8000
+    @staticmethod
+    def _ast_summary(detail: dict) -> str:
+        """Compact, judge-facing diagnosis from the AST item/symbol sets."""
+        def short(s, n=12):
+            xs = sorted(x.split("::")[-1] for x in s)
+            return ", ".join(xs[:n]) + (" …" if len(xs) > n else "") if xs else "(none)"
+
+        gi, ai = detail.get("gold_items", set()), detail.get("agent_items", set())
+        gr, ar = detail.get("gold_refs", set()), detail.get("agent_refs", set())
+        return (
+            f"- reference edits items: {short(gi)}\n"
+            f"- patch also edits:      {short(ai & gi)}  (matched)\n"
+            f"- reference items MISSED by patch: {short(gi - ai)}\n"
+            f"- symbols the reference uses but patch does NOT: {short(gr - ar)}"
+        )
 
     @staticmethod
     def _judge_score_from_verdict(verdict: dict) -> float:
@@ -844,30 +854,31 @@ Return ONLY this JSON. No markdown fences, no prose outside it:
                 w_sum += w
         return max(0.0, min(1.0, total / (w_sum * 10))) if w_sum > 0 else None
 
-    async def _maybe_judge(self, state, agent_diff: str, compile_errors: str = "") -> float | None:
-        """Structured LLM judge using a 4-dimension anchored rubric (Kimi-K2.6).
+    async def _maybe_judge(self, state, agent_diff: str, ast_detail: dict | None = None, compile_errors: str = "") -> float | None:
+        """Compact LLM judge — 2 orthogonal dims (correctness, completeness).
 
-        Returns a weighted [0,1] score across correctness/completeness/convention/hygiene,
-        or None on any error — None makes score_rollout renormalize over structural+style.
+        Sends the task + agent patch + a precomputed AST diagnosis (NOT the raw
+        gold diff) to keep context small, and forces a JSON object via
+        response_format with a fixed seed for determinism. Returns a weighted
+        [0,1] score, or None on any error (caller renormalizes over struct+style).
         """
-        base_url = os.environ.get("JUDGE_BASE_URL", "http://103.48.43.252:8000/v1")
-        model = os.environ.get("JUDGE_MODEL", "kimi-k2-6-dev")
+        base_url = os.environ.get("JUDGE_BASE_URL", "https://grid.ai.juspay.net/v1")
+        model = os.environ.get("JUDGE_MODEL", "minimaxai/minimax-m2")
         if not base_url or not model:
             return None
 
-        gold_patch = state.get("answer") or ""
         info = state.get("info") or {}
         task = info.get("task_description") or state.get("question") or ""
-
-        # Trim diffs to keep context small — judge needs the shape, not every line
-        user = self._JUDGE_USER_TEMPLATE.format(
-            task=task[:1500],
-            expected_diff=gold_patch[:4000],
-            agent_diff=agent_diff[:4000],
+        ast_summary = self._ast_summary(ast_detail or {})
+        compile_line = (
+            f"\n- cargo check FAILED: {compile_errors[:300]}" if compile_errors else ""
         )
-        # Append compiler errors concisely — avoids polluting the main rubric section
-        if compile_errors:
-            user += f"\n\n## Compiler errors (cargo check failed)\n```\n{compile_errors[:400]}\n```"
+        user = self._JUDGE_USER_TEMPLATE.format(
+            task=task[: self._JUDGE_MAX_TASK_CHARS],
+            agent_diff=agent_diff[: self._JUDGE_MAX_DIFF_CHARS],
+            ast_summary=ast_summary,
+            compile_line=compile_line,
+        )
 
         import urllib.request
 
@@ -878,10 +889,13 @@ Return ONLY this JSON. No markdown fences, no prose outside it:
                 {"role": "user", "content": user},
             ],
             "temperature": 0.0,
-            # Kimi-K2.6 is a reasoning model — it spends tokens thinking before
-            # emitting the verdict JSON. 256 was far too small (it hit the length
-            # limit mid-reasoning, never produced JSON → silent None). Give it
-            # room for reasoning + the JSON.
+            "seed": 0,  # determinism across identical prompts
+            # Force a valid JSON object — eliminates the reasoning-prose / malformed
+            # JSON outputs that were failing ~84% of judge calls.
+            "response_format": {"type": "json_object"},
+            # kimi-k2-6 is a reasoning model that thinks in `content` before the
+            # JSON; on a real (full-task) prompt 2048 truncated mid-reasoning
+            # (finish=length, no JSON). Give it room to reason AND emit.
             "max_tokens": 4096,
         }).encode()
         req = urllib.request.Request(
@@ -902,7 +916,8 @@ Return ONLY this JSON. No markdown fences, no prose outside it:
                 return json.loads(resp.read())
 
         try:
-            out = await asyncio.to_thread(_blocking_judge_call)
+            async with self._get_judge_sem():  # respect the endpoint concurrency cap
+                out = await asyncio.to_thread(_blocking_judge_call)
             msg = out["choices"][0]["message"]
             text = msg.get("content") or ""
             # Reasoning models may return the answer after a `reasoning` field or
@@ -976,7 +991,7 @@ Return ONLY this JSON. No markdown fences, no prose outside it:
         # reads the base files from the sandbox (async) and parses them.
         file_f1 = file_targeting_f1(gold_patch, agent_diff)
         style = await asyncio.to_thread(check_style_compliance, agent_diff)
-        ast_f1, ast_loc, ast_ref = await self._ast_item_f1(
+        ast_f1, ast_loc, ast_ref, ast_detail = await self._ast_item_f1(
             sandbox_client, sandbox_id, gold_patch, agent_diff
         )
         if ast_f1 is None:
@@ -999,7 +1014,7 @@ Return ONLY this JSON. No markdown fences, no prose outside it:
         compiles = 1.0 if compile_ok else 0.0
 
         # ---- optional judge (None offline → renormalize) ----
-        judge = await self._maybe_judge(state, agent_diff, compile_errors=compile_errors)
+        judge = await self._maybe_judge(state, agent_diff, ast_detail=ast_detail, compile_errors=compile_errors)
         if judge is None:
             total = self.W_STRUCT + self.W_STYLE
             quality = (self.W_STRUCT * structural + self.W_STYLE * style) / total

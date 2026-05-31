@@ -12,10 +12,35 @@ The reward lives in `HyperswitchRubric._compute_reward` (`my_custom_env.py`).
 
 ```
 reward  = (1 - W_COMPILE)·quality + W_COMPILE·compiles      # W_COMPILE = 0.3
-quality = 0.55·structural + 0.15·style + 0.30·judge         # judge optional → renormalize
+quality = 0.70·structural + 0.15·style + 0.15·judge         # judge optional → renormalize
 structural = 0.30·file_f1 + 0.70·ast
 ast        = 0.5·location_f1 + 0.5·reference_f1
 ```
+
+### Judge model & serving (hard-won)
+
+The judge contributes **correctness + completeness** (its orthogonal value) at
+`W_JUDGE=0.30`. Getting a usable judge took real testing:
+
+- **kimi-k2-6-dev is UNUSABLE as a judge.** It's a reasoning model whose chat
+  template forces "thinking" in `content`. On any non-trivial prompt it burns
+  the entire `max_tokens` (tested to 4096) reasoning and **never emits the JSON**
+  (`finish=length`). `response_format=json_object`, `reasoning_effort=none`,
+  `enable_thinking=false`, assistant-prefill, and even a "skip drafting, FULL
+  SEND" anxiety prompt do **not** stop it (the anxiety prompt worked only on a
+  toy prompt). → ~84% of judge calls returned None. Do not use reasoning models.
+- **minimax-m2 (via `https://grid.ai.juspay.net/v1`) WORKS** — emits clean JSON
+  (`finish=stop`) on real prompts, ~15–45s. Configured as the default judge.
+- **The grid endpoint hard-caps at 5 concurrent** — firing 12 gave exactly 6 OK
+  + 6 instant `HTTP 429` (rejected, not queued). So judge calls go through a
+  process-global `Semaphore(JUDGE_CONCURRENCY=5)`. Latency cost: ~`⌈N/5⌉ ×
+  per-call` per step — a real bottleneck at 64 rollouts/step; revisit if it
+  dominates (judge a subset, or get a higher-concurrency fast instruct model).
+- Set `JUDGE_API_KEY` (and optionally `JUDGE_BASE_URL` / `JUDGE_MODEL` /
+  `JUDGE_CONCURRENCY`) in the launch env. The key is never hardcoded.
+- Prompt is compact: full task + patch + the **AST diagnosis** (matched/missed
+  items, missing reference symbols, compile status) instead of the raw gold
+  diff. `response_format=json_object` + `seed=0` for reliability/determinism.
 
 - **file_f1** — F1 over the *set of files* the patch changes vs gold.
 - **location_f1** — F1 over the *Rust items* (fn/struct/impl/enum/trait/mod/…)
