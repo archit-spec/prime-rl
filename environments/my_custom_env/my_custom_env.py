@@ -1002,19 +1002,24 @@ Return ONLY: {{"correctness":{{"score":<int>}},"completeness":{{"score":<int>}}}
         else:
             structural = 0.30 * file_f1 + 0.70 * ast_f1
 
-        # ---- compile signal (additive, not a multiplicative gate) ----
-        # Skip the (expensive, ~10min) cargo check when the agent touched no
-        # crate code — nothing to build, so no compile credit (and don't burn
-        # the time). compiles ∈ {0,1}; None means "not checked".
+        # ---- compile + judge, run CONCURRENTLY ----
+        # cargo check is ~10min; the judge is ~15-45s. Running them concurrently
+        # (instead of judge-after-cargo) hides the judge latency entirely under
+        # the compile. They're independent: compile is its own additive reward
+        # term, and the judge scores logic correctness/completeness — it doesn't
+        # need the compiler errors (so it can start immediately, not wait).
+        # Skip cargo (no credit, no cost) when no crate code is touched.
         packages = self._touched_packages(agent_diff)
         if packages:
-            compile_ok, compile_errors = await self._cargo_check(sandbox_client, sandbox_id, packages)
+            (compile_ok, compile_errors), judge = await asyncio.gather(
+                self._cargo_check(sandbox_client, sandbox_id, packages),
+                self._maybe_judge(state, agent_diff, ast_detail=ast_detail),
+            )
         else:
             compile_ok, compile_errors = None, ""
+            judge = await self._maybe_judge(state, agent_diff, ast_detail=ast_detail)
         compiles = 1.0 if compile_ok else 0.0
 
-        # ---- optional judge (None offline → renormalize) ----
-        judge = await self._maybe_judge(state, agent_diff, ast_detail=ast_detail, compile_errors=compile_errors)
         if judge is None:
             total = self.W_STRUCT + self.W_STYLE
             quality = (self.W_STRUCT * structural + self.W_STYLE * style) / total
