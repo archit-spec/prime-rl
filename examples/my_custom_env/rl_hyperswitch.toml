@@ -24,7 +24,7 @@ name = "glm47-flash-compile-gated-structural"
 # 2 examples/step improves advantage variance vs 1 example/step.
 batch_size = 32
 rollouts_per_example = 8
-max_inflight_rollouts = 32
+max_inflight_rollouts = 64
 
 [orchestrator.train.sampling]
 max_completion_tokens = 4096

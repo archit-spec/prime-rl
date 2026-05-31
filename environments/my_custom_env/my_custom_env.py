@@ -7,21 +7,23 @@ image (dumball/hyperswitch-rl:d2457784) that has the hyperswitch repo at
 /hyperswitch.
 
 Reward — we train for *mergeable* patches, not merely test-passing ones.
-The dense reward is compile-gated and structurally weighted:
+The dense reward is structurally weighted with an ADDITIVE compile term
+(see REWARD_DESIGN.md for the full reasoning):
 
-    reward = compile_factor × ( w_struct·structural
-                              + w_style ·style
-                              + w_judge ·judge )
+    reward  = (1 - w_compile)·quality + w_compile·compiles
+    quality = w_struct·structural + w_style·style + w_judge·judge
 
-    compile_factor = 1.0   if `cargo check -p <touched crates>` passes
-                   = 0.25  otherwise           (close-but-doesn't-build)
+    structural = 0.30·file_targeting_F1   (right files?)
+               + 0.70·ast                 (right items + right symbols?)
+    ast        = 0.5·location_F1          (edits land in the same fns/structs)
+               + 0.5·reference_F1         (edits USE the same types/fields/methods)
 
-    structural = 0.45·file_targeting_F1   (right files?)
-               + 0.35·region_overlap      (right lines/region?)
-               + 0.20·diff_similarity     (right change shape?)
+    compiles   = 1.0 if `cargo check -p <touched crates>` passes else 0.0
+                 (ADDITIVE, not a ×0.25 gate — a multiplicative gate squashed
+                  structural variance and starved the GRPO gradient)
 
     style = Rust style checker (no unwrap/panic/unsafe/dbg/as-cast)
-    judge = optional Haiku merge-quality rating; when no API key is
+    judge = optional LLM merge-quality rating; when no API key is
             available it returns None and the remaining weights are
             renormalized (so the env runs fully offline).
 
@@ -361,6 +363,60 @@ def _f1(gold: set[str], pred: set[str]) -> float | None:
     return 2 * precision * recall / (precision + recall)
 
 
+# Boilerplate symbols that carry no localization signal — every Rust patch
+# mentions these, so counting them would just add noise to reference overlap.
+_REF_STOPLIST = {
+    "String", "str", "Option", "Some", "None", "Result", "Ok", "Err", "Vec",
+    "Box", "Self", "self", "Default", "From", "Into", "clone", "into", "to_string",
+    "to_owned", "as_ref", "as_str", "unwrap", "expect", "is_some", "is_none",
+    "iter", "collect", "map", "and_then", "unwrap_or", "unwrap_or_default",
+    "len", "push", "new", "default", "HashMap", "BTreeMap", "u8", "u16", "u32",
+    "u64", "i32", "i64", "f64", "bool", "char", "Vec", "format",
+}
+
+# tree-sitter node types that denote a *referenced* symbol (a type, a field or
+# method name, or a path segment) — as opposed to a binding/declaration.
+_REF_NODE_TYPES = {"type_identifier", "field_identifier"}
+
+
+def _referenced_symbols(diff_text: str) -> set[str]:
+    """Symbols the diff's ADDED code references — to full nesting depth.
+
+    Parses only the added (`+`) lines and walks the whole fragment AST, so a
+    chain like `item.router_data.connector_request_reference_id.clone()` yields
+    {router_data, connector_request_reference_id, clone}. Captures types, field
+    accesses, method names and path segments; drops common boilerplate. This is
+    the "did the edit USE the right APIs/types/fields" signal — complementary to
+    location (which only says *where* the edit lives).
+    """
+    added = "\n".join(
+        l[1:] for l in (diff_text or "").splitlines()
+        if l.startswith("+") and not l.startswith("+++")
+    )
+    if not added.strip():
+        return set()
+    from tree_sitter import Parser
+
+    src = added.encode("utf-8", "replace")
+    tree = Parser(_rust_language()).parse(src)
+    out: set[str] = set()
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
+        if node.type in _REF_NODE_TYPES:
+            sym = src[node.start_byte : node.end_byte].decode("utf-8", "replace")
+            if sym and sym not in _REF_STOPLIST:
+                out.add(sym)
+        elif node.type == "call_expression":
+            fn = node.child_by_field_name("function")
+            if fn is not None and fn.type in ("identifier", "scoped_identifier"):
+                sym = src[fn.start_byte : fn.end_byte].decode("utf-8", "replace").split("::")[-1]
+                if sym and sym not in _REF_STOPLIST:
+                    out.add(sym)
+        stack.extend(node.children)
+    return out
+
+
 # ── Repo2RLEnv: Test-Execution Grading (inlined from reward.py) ────────
 
 @dataclass(slots=True)
@@ -572,13 +628,19 @@ _DIFF_HEADER_RE = re.compile(r"^diff --git a/(\S+) b/(\S+)$", re.MULTILINE)
 
 
 class HyperswitchRubric(vf.Rubric):
-    """Compile-gated, structurally-weighted reward for mergeable patches.
+    """Structurally-weighted reward for mergeable patches, with an ADDITIVE
+    compile term (not a multiplicative gate).
 
-        reward = compile_factor × ( 0.55·structural + 0.15·style + 0.30·judge )
+        reward = (1 - COMPILE_WEIGHT)·quality  +  COMPILE_WEIGHT·compiles
+        quality = 0.55·structural + 0.15·style + 0.30·judge
+        structural = 0.30·file_targeting_F1 + 0.70·ast    (ast = location+reference)
 
-    where structural = 0.45·file_targeting_F1 + 0.35·region_overlap
-                     + 0.20·diff_similarity, and compile_factor is 1.0 when
-    `cargo check` on the touched crates passes else COMPILE_FAIL_FACTOR.
+    Compile is ADDITIVE so it doesn't squash the gold-anchored structural
+    variance: a multiplicative ×0.25 gate collapsed two patches scoring 0.4 vs
+    0.8 into ~0.1 vs 0.2, killing the within-group reward variance that GRPO
+    advantages (and thus the gradient) feed on. Additive keeps quality at full
+    scale while still rewarding code that actually builds — an orthogonal,
+    solution-agnostic signal the gold-diff comparison can't provide.
 
     The LLM judge is optional: when no API key is configured it returns
     None and the remaining (structural+style) weights are renormalized, so
@@ -591,59 +653,88 @@ class HyperswitchRubric(vf.Rubric):
     W_STRUCT = 0.55
     W_STYLE = 0.15
     W_JUDGE = 0.30
-    # Partial credit for a structurally-good patch that doesn't compile —
-    # a near-miss should beat a no-op, but never out-score a building patch.
-    COMPILE_FAIL_FACTOR = 0.25
+    # Additive compile term: this fraction of the reward is "does it build",
+    # the rest is quality. Additive (not multiplicative) so structural variance
+    # survives — see class docstring.
+    COMPILE_WEIGHT = 0.3
     CARGO_CHECK_TIMEOUT = 600
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.add_reward_func(self._compute_reward)
 
-    async def _ast_item_f1(self, client, sandbox_id, gold_diff: str, agent_diff: str) -> float | None:
-        """AST-level localization F1: do gold and agent touch the same Rust items?
+    # AST reward = location (which items the edit lives in) blended with
+    # reference (which types/fields/methods the edit uses). Location says
+    # "right place"; reference says "right content" — a patch that declares a
+    # field in the correct struct but never wires it up scores high on location
+    # and low on reference, which is exactly the signal we want.
+    AST_LOCATION_WEIGHT = 0.5
+    AST_REFERENCE_WEIGHT = 0.5
 
-        Reads each touched base file once from the sandbox (`git show HEAD:<f>`,
-        HEAD == base_commit) and maps both diffs' base line numbers onto that
-        file's full AST. Returns F1 over the item sets, or None when gold touches
-        no parseable item (caller falls back to file-level — no spurious 1.0).
+    async def _ast_item_f1(self, client, sandbox_id, gold_diff: str, agent_diff: str) -> tuple[float | None, float | None, float | None]:
+        """Returns (blended, location_f1, reference_f1).
+
+        location_f1: maps each diff's changed base-line numbers onto the FULL
+          base-file tree-sitter AST (`git show HEAD:<f>`, HEAD == base_commit)
+          and F1s the enclosing Rust items.
+        reference_f1: F1 over the symbols (types/fields/methods, to depth) the
+          ADDED code references.
+        Each component is None when its gold side is empty; blended is None only
+        when BOTH are (caller then falls back to file-level — no spurious 1.0).
         """
         gold_touched = _old_side_touched_lines(gold_diff)
         agent_touched = _old_side_touched_lines(agent_diff)
         files = [f for f in (set(gold_touched) | set(agent_touched)) if f.endswith(".rs")]
-        if not files:
-            return None
-
-        async def _read_base(f: str) -> tuple[str, str]:
-            res = await client.execute_command(
-                sandbox_id, f"git show HEAD:{shlex.quote(f)} 2>/dev/null", working_dir=WORKDIR
-            )
-            return f, (res.stdout or "")
 
         gold_items: set[str] = set()
         agent_items: set[str] = set()
-        for f, content in await asyncio.gather(*(_read_base(f) for f in files)):
-            if not content.strip():
-                continue
-            src = content.encode("utf-8", "replace")
-            gi, ai = await asyncio.gather(
-                asyncio.to_thread(_items_for_lines, src, f, gold_touched.get(f, set())),
-                asyncio.to_thread(_items_for_lines, src, f, agent_touched.get(f, set())),
-            )
-            gold_items |= gi
-            agent_items |= ai
-        return _f1(gold_items, agent_items)
+        if files:
+            async def _read_base(f: str) -> tuple[str, str]:
+                res = await client.execute_command(
+                    sandbox_id, f"git show HEAD:{shlex.quote(f)} 2>/dev/null", working_dir=WORKDIR
+                )
+                return f, (res.stdout or "")
+
+            for f, content in await asyncio.gather(*(_read_base(f) for f in files)):
+                if not content.strip():
+                    continue
+                src = content.encode("utf-8", "replace")
+                gi, ai = await asyncio.gather(
+                    asyncio.to_thread(_items_for_lines, src, f, gold_touched.get(f, set())),
+                    asyncio.to_thread(_items_for_lines, src, f, agent_touched.get(f, set())),
+                )
+                gold_items |= gi
+                agent_items |= ai
+
+        location = _f1(gold_items, agent_items)
+        gold_refs, agent_refs = await asyncio.gather(
+            asyncio.to_thread(_referenced_symbols, gold_diff),
+            asyncio.to_thread(_referenced_symbols, agent_diff),
+        )
+        reference = _f1(gold_refs, agent_refs)
+
+        # Blend, renormalizing over whichever components are defined.
+        parts = []
+        if location is not None:
+            parts.append((self.AST_LOCATION_WEIGHT, location))
+        if reference is not None:
+            parts.append((self.AST_REFERENCE_WEIGHT, reference))
+        if not parts:
+            blended = None
+        else:
+            wsum = sum(w for w, _ in parts)
+            blended = sum(w * v for w, v in parts) / wsum
+        return blended, location, reference
 
     @staticmethod
     def _touched_packages(agent_diff: str) -> set[str]:
-        """Crate names under crates/<pkg>/..., capped at 3; defaults to router."""
+        """Crate names under crates/<pkg>/..., capped at 3. Empty when the diff
+        touches no crate code — the caller then skips the compile gate."""
         pkgs: set[str] = set()
         for f in _files_in_diff(agent_diff):
             parts = f.split("/")
             if len(parts) > 1 and parts[0] == "crates":
                 pkgs.add(parts[1])
-        if not pkgs:
-            pkgs.add("router")
         return set(list(pkgs)[:3])
 
     async def _cargo_check(self, client, sandbox_id, packages: set[str]) -> tuple[bool, str]:
@@ -885,7 +976,9 @@ Return ONLY this JSON. No markdown fences, no prose outside it:
         # reads the base files from the sandbox (async) and parses them.
         file_f1 = file_targeting_f1(gold_patch, agent_diff)
         style = await asyncio.to_thread(check_style_compliance, agent_diff)
-        ast_f1 = await self._ast_item_f1(sandbox_client, sandbox_id, gold_patch, agent_diff)
+        ast_f1, ast_loc, ast_ref = await self._ast_item_f1(
+            sandbox_client, sandbox_id, gold_patch, agent_diff
+        )
         if ast_f1 is None:
             # AST signal undefined (gold touches no parseable Rust item, e.g. a
             # non-.rs or new file). Fall back to file-level localization only —
@@ -894,10 +987,16 @@ Return ONLY this JSON. No markdown fences, no prose outside it:
         else:
             structural = 0.30 * file_f1 + 0.70 * ast_f1
 
-        # ---- compile gate ----
+        # ---- compile signal (additive, not a multiplicative gate) ----
+        # Skip the (expensive, ~10min) cargo check when the agent touched no
+        # crate code — nothing to build, so no compile credit (and don't burn
+        # the time). compiles ∈ {0,1}; None means "not checked".
         packages = self._touched_packages(agent_diff)
-        compile_ok, compile_errors = await self._cargo_check(sandbox_client, sandbox_id, packages)
-        compile_factor = 1.0 if compile_ok else self.COMPILE_FAIL_FACTOR
+        if packages:
+            compile_ok, compile_errors = await self._cargo_check(sandbox_client, sandbox_id, packages)
+        else:
+            compile_ok, compile_errors = None, ""
+        compiles = 1.0 if compile_ok else 0.0
 
         # ---- optional judge (None offline → renormalize) ----
         judge = await self._maybe_judge(state, agent_diff, compile_errors=compile_errors)
@@ -911,12 +1010,16 @@ Return ONLY this JSON. No markdown fences, no prose outside it:
                 + self.W_JUDGE * judge
             )
 
-        reward = compile_factor * quality
+        # Additive: quality keeps its full variance; compile adds a clean bonus.
+        reward = (1 - self.COMPILE_WEIGHT) * quality + self.COMPILE_WEIGHT * compiles
         state["reward_breakdown"] = {
             "file_targeting_f1": round(file_f1, 4),
             "ast_item_f1": round(ast_f1, 4) if ast_f1 is not None else None,
+            "ast_location_f1": round(ast_loc, 4) if ast_loc is not None else None,
+            "ast_reference_f1": round(ast_ref, 4) if ast_ref is not None else None,
             "structural": round(structural, 4),
             "style": round(style, 4),
+            "quality": round(quality, 4),
             "compile_ok": compile_ok,
             "judge": judge,
             "reward": round(reward, 4),
@@ -951,7 +1054,7 @@ class HyperswitchTaskSet(SandboxTaskSet):
     def get_sandbox_spec(self, info: dict) -> SandboxSpec:
         return SandboxSpec(
             image=self.SANDBOX_IMAGE,
-            cpu_cores=4,
+            cpu_cores=8,
             memory_gb=16,
             disk_size_gb=20,
         )
