@@ -1,4 +1,4 @@
-max_steps = 100
+max_steps = 200
 # GLM-4.7-Flash has a 154880-token vocab. The vanilla LM head materializes a
 # full [seq, vocab] fp32 logits tensor at loss time (seq_len * 154880 * 4 B),
 # which OOMs the trainer backward. We enable the fused/chunked LM head below
