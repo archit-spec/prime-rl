@@ -92,6 +92,23 @@ class LocalDockerSandboxClient:
         self._executor = ThreadPoolExecutor(
             max_workers=self.max_workers, thread_name_prefix="local-docker-sandbox"
         )
+        self._cleanup_stale_containers()
+
+    def _cleanup_stale_containers(self) -> None:
+        """Kill any r2e-rl-* containers left over from a previous worker process.
+
+        On restart the interception server starts fresh with no registered
+        rollout IDs, so containers from a prior run would get 404s and hang
+        forever.  Removing them here prevents that deadlock.
+        """
+        result = subprocess.run(
+            ["docker", "ps", "-q", "--filter", "name=r2e-rl-"],
+            capture_output=True,
+            text=True,
+        )
+        ids = result.stdout.split()
+        if ids:
+            subprocess.run(["docker", "rm", "-vf"] + ids, capture_output=True)
 
     # -- internal helpers ---------------------------------------------------
 
@@ -321,11 +338,8 @@ class LocalDockerSandboxClient:
 
     async def delete(self, sandbox_id: str) -> dict:
         sandbox = self._containers.pop(sandbox_id, None)
-        if sandbox is None:
-            return {"status": "not_found"}
-        await self._run(
-            ["docker", "rm", "-vf", sandbox.container_name], timeout=120
-        )
+        container_name = sandbox.container_name if sandbox else f"r2e-rl-{sandbox_id}"
+        await self._run(["docker", "rm", "-vf", container_name], timeout=120)
         return {"status": "deleted"}
 
     async def bulk_delete(self, sandbox_ids, **_) -> dict:

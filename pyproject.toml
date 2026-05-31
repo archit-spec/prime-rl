@@ -35,6 +35,8 @@ dependencies = [
     "tilelang>=0.1.8",
     "flash-linear-attention",
     "nvidia-ml-py>=12.575.51",
+    "tree-sitter>=0.23.0",
+    "tree-sitter-rust>=0.23.0",
 ]
 
 [project.scripts]

@@ -40,11 +40,12 @@ Repo2RLEnv utilities inlined below are from:
 
 from __future__ import annotations
 
-import difflib
+import asyncio
 import logging
 import os
 import re
 import json
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -204,11 +205,7 @@ SYSTEM_PROMPTS = {
     ),
 }
 
-# ── Repo2RLEnv: Diff-Similarity Reward (inlined from reward.py) ────────
-# Source: https://github.com/huggingface/Repo2RLEnv/blob/main/src/repo2rlenv/reward.py
-# License: Apache-2.0
-# Concept inspired by SWE-RL (Wei et al., NeurIPS '25, arXiv:2502.18449);
-# this is an independent reimplementation using Python's stdlib difflib.
+# ── Diff parsing helpers (shared by file/AST structural rewards) ─────────
 
 _HUNK_HEADER_RE = re.compile(r"^@@.*@@")
 _FILE_HEADER_RE = re.compile(r"^(?:---|\+\+\+) ")
@@ -243,37 +240,125 @@ def _normalize_diff(diff: str) -> list[str]:
     return lines
 
 
-def calculate_diff_similarity_reward(
-    oracle_diff: str, predicted_diff: str
-) -> tuple[float, DiffRewardMetadata]:
-    """Score a predicted diff against an oracle diff.
+# ── AST-level structural reward (tree-sitter-rust) ───────────────────────
+# Replaces textual diff-line similarity. Matching diff LINES punishes
+# equivalent code written differently and is fooled by shifted line numbers.
+# Instead we parse the patched Rust with tree-sitter and score WHICH named
+# items the change actually touches — functions, structs, enums, unions,
+# traits, impl targets, modules, consts, type aliases, macros. This is the
+# "what the AST is affecting" signal: did the agent modify the same semantic
+# units as the gold solution, regardless of formatting or line positions?
 
-    Returns (reward, metadata) where reward ∈ [0, 1]:
-      - 1.0  if normalized diffs are identical
-      - 0.0  if predicted_diff is empty or unparseable
-      - else difflib.SequenceMatcher ratio over normalized lines
+_TS_NAMED_ITEMS = {
+    "function_item", "struct_item", "enum_item", "union_item", "trait_item",
+    "mod_item", "const_item", "static_item", "type_item", "macro_definition",
+}
+
+_ts_language = None
+
+
+def _rust_language():
+    """Cached tree-sitter Rust Language. Safe to share across threads; Parser
+    objects are NOT, so callers build a fresh Parser per use."""
+    global _ts_language
+    if _ts_language is None:
+        import tree_sitter_rust as tsr
+        from tree_sitter import Language
+
+        _ts_language = Language(tsr.language())
+    return _ts_language
+
+
+def _old_side_touched_lines(diff_text: str) -> dict[str, set[int]]:
+    """Per base file (a/ path), the 1-based BASE line numbers the diff touches.
+
+    Tracks old-side line numbers from the hunk headers: removed lines are
+    touched directly; added lines are attributed to the base line they're
+    inserted after. Both the agent diff (`git diff --cached HEAD`) and the gold
+    diff are taken against the same base_commit, so their old-side line numbers
+    index the SAME base file — which we parse in full to find the enclosing
+    item even when the edit is deep inside a function body.
     """
-    if not predicted_diff.strip():
-        return 0.0, DiffRewardMetadata(0.0, 0, 0, 0, "empty prediction")
+    touched: dict[str, set[int]] = {}
+    current: str | None = None
+    old_ln = 0
+    for line in (diff_text or "").splitlines():
+        hm = _DIFF_HEADER_RE.match(line)
+        if hm:
+            current = hm.group(1)  # a/ (base) path
+            touched.setdefault(current, set())
+            continue
+        if current is None:
+            continue
+        m = re.match(r"^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@", line)
+        if m:
+            old_ln = int(m.group(1))
+            continue
+        if line.startswith(("---", "+++")):
+            continue
+        if line.startswith("-"):
+            touched[current].add(old_ln)
+            old_ln += 1
+        elif line.startswith("+"):
+            touched[current].add(max(old_ln - 1, 1))  # insertion point in base
+        else:  # context line
+            old_ln += 1
+    return touched
 
-    oracle_lines = _normalize_diff(oracle_diff)
-    pred_lines = _normalize_diff(predicted_diff)
 
-    if not oracle_lines:
-        return 0.0, DiffRewardMetadata(
-            0.0, len(pred_lines), 0, 0, "empty oracle after normalization"
-        )
+def _items_for_lines(base_src: bytes, fpath: str, lines: set[int]) -> set[str]:
+    """Map 1-based base line numbers to their innermost enclosing Rust item.
 
-    matcher = difflib.SequenceMatcher(a=oracle_lines, b=pred_lines, autojunk=False)
-    ratio = matcher.ratio()
-    matched = sum(triple.size for triple in matcher.get_matching_blocks())
+    Parses the FULL base file, so an edit anywhere inside a function/impl/struct
+    resolves to that item — fixing the fragment-parse blind spot for in-body
+    edits. Returns `file::kind:name` labels.
+    """
+    if not lines:
+        return set()
+    from tree_sitter import Parser
 
-    return ratio, DiffRewardMetadata(
-        similarity=ratio,
-        pred_lines=len(pred_lines),
-        oracle_lines=len(oracle_lines),
-        matched_lines=matched,
-    )
+    tree = Parser(_rust_language()).parse(base_src)
+    spans: list[tuple[int, int, str]] = []  # (start0, end0, label) 0-based
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
+        if node.type in _TS_NAMED_ITEMS:
+            name_node = node.child_by_field_name("name") or node.child_by_field_name("type")
+            name = (
+                base_src[name_node.start_byte : name_node.end_byte].decode("utf-8", "replace")
+                if name_node else "<anon>"
+            )
+            kind = node.type.replace("_item", "").replace("_definition", "")
+            spans.append((node.start_point[0], node.end_point[0], f"{fpath}::{kind}:{name}"))
+        stack.extend(node.children)
+
+    out: set[str] = set()
+    for ln in lines:
+        i = ln - 1  # 0-based
+        best: tuple[int, str] | None = None  # (span_size, label)
+        for start, end, label in spans:
+            if start <= i <= end:
+                size = end - start
+                if best is None or size < best[0]:
+                    best = (size, label)
+        if best is not None:
+            out.add(best[1])
+    return out
+
+
+def _f1(gold: set[str], pred: set[str]) -> float | None:
+    """F1 over two item sets. Returns None when gold is empty (signal undefined)
+    so the caller can fall back instead of awarding a spurious perfect score."""
+    if not gold:
+        return None
+    if not pred:
+        return 0.0
+    tp = len(gold & pred)
+    if not tp:
+        return 0.0
+    precision = tp / len(pred)
+    recall = tp / len(gold)
+    return 2 * precision * recall / (precision + recall)
 
 
 # ── Repo2RLEnv: Test-Execution Grading (inlined from reward.py) ────────
@@ -515,6 +600,40 @@ class HyperswitchRubric(vf.Rubric):
         super().__init__(**kwargs)
         self.add_reward_func(self._compute_reward)
 
+    async def _ast_item_f1(self, client, sandbox_id, gold_diff: str, agent_diff: str) -> float | None:
+        """AST-level localization F1: do gold and agent touch the same Rust items?
+
+        Reads each touched base file once from the sandbox (`git show HEAD:<f>`,
+        HEAD == base_commit) and maps both diffs' base line numbers onto that
+        file's full AST. Returns F1 over the item sets, or None when gold touches
+        no parseable item (caller falls back to file-level — no spurious 1.0).
+        """
+        gold_touched = _old_side_touched_lines(gold_diff)
+        agent_touched = _old_side_touched_lines(agent_diff)
+        files = [f for f in (set(gold_touched) | set(agent_touched)) if f.endswith(".rs")]
+        if not files:
+            return None
+
+        async def _read_base(f: str) -> tuple[str, str]:
+            res = await client.execute_command(
+                sandbox_id, f"git show HEAD:{shlex.quote(f)} 2>/dev/null", working_dir=WORKDIR
+            )
+            return f, (res.stdout or "")
+
+        gold_items: set[str] = set()
+        agent_items: set[str] = set()
+        for f, content in await asyncio.gather(*(_read_base(f) for f in files)):
+            if not content.strip():
+                continue
+            src = content.encode("utf-8", "replace")
+            gi, ai = await asyncio.gather(
+                asyncio.to_thread(_items_for_lines, src, f, gold_touched.get(f, set())),
+                asyncio.to_thread(_items_for_lines, src, f, agent_touched.get(f, set())),
+            )
+            gold_items |= gi
+            agent_items |= ai
+        return _f1(gold_items, agent_items)
+
     @staticmethod
     def _touched_packages(agent_diff: str) -> set[str]:
         """Crate names under crates/<pkg>/..., capped at 3; defaults to router."""
@@ -682,9 +801,17 @@ Return ONLY this JSON. No markdown fences, no prose outside it:
                 "Authorization": f"Bearer {os.environ.get('JUDGE_API_KEY', 'EMPTY')}",
             },
         )
-        try:
+        def _blocking_judge_call() -> dict:
+            # Synchronous network I/O — MUST run off the event loop. urllib here
+            # would otherwise freeze the worker's asyncio loop for the full
+            # request (a reasoning judge can take >30s), starving the heartbeat
+            # `stats_loop` and getting the whole worker killed + all rollouts
+            # cancelled before any reward is ever returned.
             with urllib.request.urlopen(req, timeout=180) as resp:
-                out = json.loads(resp.read())
+                return json.loads(resp.read())
+
+        try:
+            out = await asyncio.to_thread(_blocking_judge_call)
             msg = out["choices"][0]["message"]
             text = msg.get("content") or ""
             # Reasoning models may return the answer after a `reasoning` field or
@@ -753,14 +880,19 @@ Return ONLY this JSON. No markdown fences, no prose outside it:
             )
             return 0.0
 
-        # ---- structural closeness to gold (dense, free) ----
-        f1 = file_targeting_f1(gold_patch, agent_diff)
-        region = region_overlap(gold_patch, agent_diff)
-        sim, _ = calculate_diff_similarity_reward(gold_patch, agent_diff)
-        structural = 0.45 * f1 + 0.35 * region + 0.20 * sim
-
-        # ---- style (merge discipline) ----
-        style = check_style_compliance(agent_diff)
+        # ---- structural + style (dense, free) ----
+        # file-targeting + style are cheap pure-string ops; AST localization
+        # reads the base files from the sandbox (async) and parses them.
+        file_f1 = file_targeting_f1(gold_patch, agent_diff)
+        style = await asyncio.to_thread(check_style_compliance, agent_diff)
+        ast_f1 = await self._ast_item_f1(sandbox_client, sandbox_id, gold_patch, agent_diff)
+        if ast_f1 is None:
+            # AST signal undefined (gold touches no parseable Rust item, e.g. a
+            # non-.rs or new file). Fall back to file-level localization only —
+            # never award the old spurious 1.0 for editing unrelated files.
+            structural = file_f1
+        else:
+            structural = 0.30 * file_f1 + 0.70 * ast_f1
 
         # ---- compile gate ----
         packages = self._touched_packages(agent_diff)
@@ -781,9 +913,8 @@ Return ONLY this JSON. No markdown fences, no prose outside it:
 
         reward = compile_factor * quality
         state["reward_breakdown"] = {
-            "file_targeting_f1": round(f1, 4),
-            "region_overlap": round(region, 4),
-            "diff_similarity": round(sim, 4),
+            "file_targeting_f1": round(file_f1, 4),
+            "ast_item_f1": round(ast_f1, 4) if ast_f1 is not None else None,
             "structural": round(structural, 4),
             "style": round(style, 4),
             "compile_ok": compile_ok,

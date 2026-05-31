@@ -24,6 +24,7 @@ name = "glm47-flash-compile-gated-structural"
 # 2 examples/step improves advantage variance vs 1 example/step.
 batch_size = 32
 rollouts_per_example = 8
+max_inflight_rollouts = 32
 
 [orchestrator.train.sampling]
 max_completion_tokens = 4096
@@ -33,7 +34,7 @@ temperature = 0.7
 id = "my-custom-env"
 
 [orchestrator.train.env.args]
-num_train_examples = 256
+num_train_examples = 8
 num_eval_examples = 32
 curriculum_level = 0
 # Env works end-to-end (vf-eval reward 0.127). Give the agent more turns now
@@ -46,7 +47,11 @@ max_turns = 80
 # we omit it and let FSDP shard across the 4 train GPUs.
 [trainer.model]
 impl = "auto"
-attn = "flash_attention_2"
+# FA3 (Hopper/H200) is ~1.5-2x faster than FA2 at long context; at seq_len
+# 102400 attention is a large share of the trainer step. transformers 5.5
+# registers flash_attention_3 and routes glm4_moe_lite (the HF auto path)
+# through it; flash_attn_3 is installed (is_flash_attn_3_available()=True).
+attn = "flash_attention_3"
 optimization_dtype = "bfloat16"
 reduce_dtype = "bfloat16"
 # cp=4 forces dp_shard=1 (world_size/cp = 4/4), so each GPU holds the FULL
