@@ -18,10 +18,11 @@ project = "hyperswitch-rl"
 name = "glm47-flash-compile-gated-structural"
 
 [orchestrator]
-# batch_size is TOTAL rollouts/step and must be divisible by
-# rollouts_per_example. 8 / 8 = 1 unique example/step; with dp_shard=4 that is
-# ~2 sequences per GPU at the loss phase, keeping the fp32 logits bounded.
-batch_size = 8
+# rollouts_per_example = 8 (group size for GRPO advantage normalization).
+# batch_size = 16 = 2 unique examples × 8 rollouts each.
+# LoRA frees ~74 GB/GPU, giving room to double the batch.
+# 2 examples/step improves advantage variance vs 1 example/step.
+batch_size = 32
 rollouts_per_example = 8
 
 [orchestrator.train.sampling]
@@ -60,6 +61,12 @@ cp = 1
 # works on the HF/auto path too (inject_prime_lm_head runs for all impls).
 fused_lm_head_token_chunk_size = "auto"
 
+# LoRA: only adapter params need optimizer states (~50M vs 26B full params).
+# Saves ~74 GB/GPU vs full fine-tuning, freeing headroom for longer context.
+[trainer.model.lora]
+rank = 32
+alpha = 64
+
 # Full activation checkpointing: recompute activations on the backward pass
 # instead of storing them. Without CP sequence sharding, each GPU processes
 # the full seq_len for every layer, so this is needed to fit activations.
@@ -80,3 +87,6 @@ tp = 4
 # FP8 KV cache halves KV-cache memory, giving more room for the long context.
 [inference.vllm_extra]
 kv_cache_dtype = "fp8"
+
+[ckpt]
+interval = 10

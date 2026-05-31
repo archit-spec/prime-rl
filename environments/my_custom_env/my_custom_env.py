@@ -70,15 +70,20 @@ from verifiers.envs.experimental.sandbox_mixin import SandboxTimeouts
 # ── Curriculum System Prompts ──────────────────────────────────────────
 
 EXECUTION_DISCIPLINE = (
-    "EXECUTION DISCIPLINE — ACT EARLY, ITERATE FAST:\n"
-    "- You have a STRICT, SMALL turn budget. You MUST make at least one `edit` within your first 3 turns — a partial edit that compiles beats no edit.\n"
-    "- Spend at most 1-2 turns exploring before your first edit. Skim, don't audit.\n"
-    "- Identify the smallest file(s) you must change, then `edit` immediately. Refine later if needed.\n"
-    "- After every edit, run `cargo check -p <package>` and fix compile errors before continuing. Never stack edits without verifying.\n"
-    "- Do not duplicate `use` imports or `impl` blocks. Search the file for an existing import/impl before adding a new one.\n"
-    "- Stop exploring once you have what you need. Long file reads or repeated `ls`/`grep` are wasted turns.\n"
-    "- NEVER end your turn without having written an edit to disk. An empty diff scores ZERO.\n"
-    "- Your reward depends on a compiling, test-passing diff. An imperfect edit that compiles beats a long investigation that doesn't.\n\n"
+    "EXECUTION DISCIPLINE — THE ONLY RULE THAT MATTERS:\n"
+    "YOUR REWARD IS MULTIPLIED BY 4x IF YOUR CODE COMPILES. A diff that compiles but is imperfect "
+    "scores 4x MORE than a perfect diff that does not compile. This is the single most important thing.\n\n"
+    "MANDATORY WORKFLOW — follow this exactly:\n"
+    "1. Explore for at most 2 turns (skim, don't audit).\n"
+    "2. Make your first `edit` by turn 3 at the latest.\n"
+    "3. IMMEDIATELY run `cargo check -p <package>` after EVERY edit.\n"
+    "4. If cargo check fails: fix the compile error NOW before doing anything else. Repeat until it passes.\n"
+    "5. Only proceed to the next edit after the current one compiles cleanly.\n\n"
+    "HARD RULES:\n"
+    "- NEVER finish without running `cargo check` on your changes.\n"
+    "- NEVER stack multiple edits without verifying each compiles first.\n"
+    "- NEVER end with an empty diff — reward is 0.0 with no edits.\n"
+    "- Do not duplicate `use` imports or `impl` blocks — search first.\n\n"
 )
 
 
@@ -522,65 +527,152 @@ class HyperswitchRubric(vf.Rubric):
             pkgs.add("router")
         return set(list(pkgs)[:3])
 
-    async def _cargo_check(self, client, sandbox_id, packages: set[str]) -> bool:
-        """True iff `cargo check -p <pkg> --tests` passes for every package.
-
-        keep_sandbox_for_scoring=True means the agent's own builds during
-        the rollout already warmed target/, so this is usually fast.
-        """
+    async def _cargo_check(self, client, sandbox_id, packages: set[str]) -> tuple[bool, str]:
+        """Returns (ok, errors) where errors is a concise compiler error summary (<500 chars)."""
         for pkg in packages:
             res = await client.execute_command(
                 sandbox_id,
-                f"cargo check -p {pkg} --tests",
+                f"cargo check -p {pkg} --tests 2>&1",
                 working_dir=WORKDIR,
                 timeout=self.CARGO_CHECK_TIMEOUT,
             )
             if res.exit_code != 0:
-                return False
-        return True
+                # Extract just `error[...]` lines to keep it concise
+                lines = (res.stdout or res.stderr or "").splitlines()
+                error_lines = [l for l in lines if l.strip().startswith("error")][:8]
+                summary = "\n".join(error_lines)[:500]
+                return False, summary
+        return True, ""
 
-    async def _maybe_judge(self, state, agent_diff: str) -> float | None:
-        """Optional LLM merge-quality judge against an OpenAI-compatible
-        endpoint (e.g. our internally-hosted GLM-5 / Kimi-2.5).
+    _JUDGE_SYSTEM = (
+        "You are a strict, evidence-driven code reviewer scoring a Rust patch on anchored "
+        "rubrics. The reference patch is ONE valid solution among many — different but "
+        "equivalent approaches MUST NOT be penalised. Only penalise things that are wrong, "
+        "broken, missing, or violate documented conventions.\n\n"
+        "CRITICAL — anchored scoring: for each dimension pick the BAND whose description "
+        "matches the evidence, then choose the exact integer score within that band's range. "
+        "Do NOT freelance scores or pick bands that don't match. Each band name and its "
+        "integer range are given in the rubric. Provide one-sentence reasoning per dimension "
+        "explaining which evidence drove your band choice.\n\n"
+        "Output a single JSON object — no prose outside it, no markdown fences."
+    )
 
-        Configured entirely by env vars so the env stays offline-by-default:
-          JUDGE_BASE_URL  — e.g. http://<host>:8000/v1   (unset ⇒ disabled)
-          JUDGE_MODEL     — e.g. zai-org/GLM-5-FP8 or moonshotai/Kimi-2.5
-          JUDGE_API_KEY   — bearer token if the endpoint needs one (else "EMPTY")
+    _JUDGE_USER_TEMPLATE = """\
+## Task
+{task}
 
-        Returns a merge-quality score in [0,1], or None when disabled / on any
-        error — None makes score_rollout renormalize over structural+style so
-        a judge outage never zeros a real patch (findings_pr11372.md: judge is
-        the biggest reward-hacking surface, so it's a backstop, not the spine).
+## Reference patch (ONE valid solution — different valid approaches are equally good)
+```diff
+{expected_diff}
+```
+
+## Agent patch (to evaluate)
+```diff
+{agent_diff}
+```
+
+## Anchored rubric
+
+### 1. correctness
+| Band | Score | Criteria |
+|------|-------|----------|
+| BROKEN | 0-1 | Empty diff, won't compile, or inverted logic. |
+| FUNDAMENTALLY_WRONG | 2-3 | Compiles but core logic wrong. |
+| PARTIAL_BUGS | 4-5 | Compiles, partially correct, definite logic bug. |
+| MOSTLY_CORRECT | 6-7 | Mostly correct, edge cases wrong. |
+| CORRECT | 8-9 | Correct for all stated cases. |
+| PERFECT | 10 | Correct AND matches reference behaviour. |
+
+### 2. completeness
+| Band | Score | Criteria |
+|------|-------|----------|
+| NONE | 0-1 | 0% of requirements addressed. |
+| MINIMAL | 2-3 | ≤25% addressed. |
+| PARTIAL | 4-5 | 25-50% addressed. |
+| SUBSTANTIAL | 6-7 | 50-75% addressed. |
+| NEARLY_COMPLETE | 8-9 | 75-99% addressed. |
+| COMPLETE | 10 | 100% addressed. |
+
+### 3. convention_adherence
+| Band | Score | Criteria |
+|------|-------|----------|
+| SEVERE | 0-1 | 4+ violations OR single absolute violation (unsafe/panic/unwrap). |
+| MULTIPLE | 2-3 | 3 violations. |
+| TWO_VIOLATIONS | 4-5 | 2 violations. |
+| ONE_VIOLATION | 6-7 | 1 violation. |
+| MINOR_LAPSES | 8-9 | Minor stylistic lapses, no documented convention broken. |
+| PERFECT | 10 | All conventions followed. |
+
+### 4. hygiene
+| Band | Score | Criteria |
+|------|-------|----------|
+| VERY_DIRTY | 0-1 | Spurious files, >50% whitespace churn, or >2 unrelated files. |
+| DIRTY | 2-3 | One spurious file OR significant unrelated changes. |
+| SOMEWHAT_DIRTY | 4-5 | Some unnecessary modifications. |
+| MOSTLY_CLEAN | 6-7 | Mostly focused, minor extraneous changes. |
+| CLEAN | 8-9 | Clean diff, scoped to task. |
+| MINIMAL | 10 | Minimal, perfectly scoped diff. |
+
+Return ONLY this JSON. No markdown fences, no prose outside it:
+{{"correctness":{{"band":"<BAND>","score":<int>}},"completeness":{{"band":"<BAND>","score":<int>}},"convention_adherence":{{"band":"<BAND>","score":<int>}},"hygiene":{{"band":"<BAND>","score":<int>}}}}"""
+
+    _JUDGE_WEIGHTS = {"correctness": 0.35, "completeness": 0.30, "convention_adherence": 0.20, "hygiene": 0.15}
+    _JUDGE_MAX_DIFF_CHARS = 8000
+
+    @staticmethod
+    def _judge_score_from_verdict(verdict: dict) -> float:
+        """Compute weighted [0,1] score from structured verdict."""
+        total, w_sum = 0.0, 0.0
+        for axis, w in HyperswitchRubric._JUDGE_WEIGHTS.items():
+            v = verdict.get(axis)
+            if isinstance(v, dict):
+                s = v.get("score")
+            else:
+                s = v
+            if isinstance(s, (int, float)):
+                total += w * float(s)
+                w_sum += w
+        return max(0.0, min(1.0, total / (w_sum * 10))) if w_sum > 0 else None
+
+    async def _maybe_judge(self, state, agent_diff: str, compile_errors: str = "") -> float | None:
+        """Structured LLM judge using a 4-dimension anchored rubric (Kimi-K2.6).
+
+        Returns a weighted [0,1] score across correctness/completeness/convention/hygiene,
+        or None on any error — None makes score_rollout renormalize over structural+style.
         """
-        base_url = os.environ.get("JUDGE_BASE_URL")
-        model = os.environ.get("JUDGE_MODEL")
+        base_url = os.environ.get("JUDGE_BASE_URL", "http://103.48.43.252:8000/v1")
+        model = os.environ.get("JUDGE_MODEL", "kimi-k2-6-dev")
         if not base_url or not model:
             return None
 
         gold_patch = state.get("answer") or ""
         info = state.get("info") or {}
         task = info.get("task_description") or state.get("question") or ""
-        prompt = (
-            "You are a senior Rust reviewer for the juspay/hyperswitch payments "
-            "monorepo. Rate whether the CANDIDATE patch is MERGE-QUALITY: it must "
-            "resolve the task, be correctly localized, minimal, and follow "
-            "hyperswitch conventions (no unwrap/panic/unsafe/as-cast, prefer typed "
-            "wrappers over stringly-typed keys, respect v1/v2 cfg split).\n\n"
-            f"# Task\n{task[:2000]}\n\n"
-            f"# Reference (gold) patch\n{gold_patch[:6000]}\n\n"
-            f"# Candidate patch\n{agent_diff[:6000]}\n\n"
-            "Reply with ONLY a float in [0,1]: 1.0 = indistinguishable from a "
-            "merge-ready patch, 0.0 = wrong or unmergeable. No other text."
+
+        # Trim diffs to keep context small — judge needs the shape, not every line
+        user = self._JUDGE_USER_TEMPLATE.format(
+            task=task[:1500],
+            expected_diff=gold_patch[:4000],
+            agent_diff=agent_diff[:4000],
         )
+        # Append compiler errors concisely — avoids polluting the main rubric section
+        if compile_errors:
+            user += f"\n\n## Compiler errors (cargo check failed)\n```\n{compile_errors[:400]}\n```"
 
         import urllib.request
 
         body = json.dumps({
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [
+                {"role": "system", "content": self._JUDGE_SYSTEM},
+                {"role": "user", "content": user},
+            ],
             "temperature": 0.0,
-            "max_tokens": 8,
+            # Kimi-K2.6 is a reasoning model — it spends tokens thinking before
+            # emitting the verdict JSON. 256 was far too small (it hit the length
+            # limit mid-reasoning, never produced JSON → silent None). Give it
+            # room for reasoning + the JSON.
+            "max_tokens": 4096,
         }).encode()
         req = urllib.request.Request(
             base_url.rstrip("/") + "/chat/completions",
@@ -591,12 +683,34 @@ class HyperswitchRubric(vf.Rubric):
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=180) as resp:
                 out = json.loads(resp.read())
-            text = out["choices"][0]["message"]["content"]
-            m = re.search(r"[01](?:\.\d+)?", text)
-            return max(0.0, min(1.0, float(m.group(0)))) if m else None
-        except Exception:
+            msg = out["choices"][0]["message"]
+            text = msg.get("content") or ""
+            # Reasoning models may return the answer after a `reasoning` field or
+            # after inline thinking prose. Extract the LAST {...} JSON object in
+            # the content (the verdict), tolerating leading reasoning text.
+            text = re.sub(r"^```(?:json)?\s*|\s*```\s*$", "", text.strip(), flags=re.MULTILINE)
+            verdict = None
+            try:
+                verdict = json.loads(text)
+            except Exception:
+                matches = re.findall(r"\{[^{}]*\"correctness\".*?\}\s*\}", text, re.DOTALL)
+                if not matches:
+                    matches = re.findall(r"\{.*\}", text, re.DOTALL)
+                if matches:
+                    verdict = json.loads(matches[-1])
+            if verdict is None:
+                raise ValueError(f"no JSON verdict in judge output: {text[:200]!r}")
+            score = self._judge_score_from_verdict(verdict)
+            logger.info("judge OK model=%s score=%s verdict=%s", model, score, verdict)
+            return score
+        except Exception as e:
+            # Log loudly — a silent None here is why the judge column looks empty.
+            logger.warning(
+                "judge FAILED model=%s base_url=%s err=%s: %s",
+                model, base_url, type(e).__name__, str(e)[:300],
+            )
             return None
 
     async def _compute_reward(self, state, **kwargs) -> float:
@@ -650,11 +764,11 @@ class HyperswitchRubric(vf.Rubric):
 
         # ---- compile gate ----
         packages = self._touched_packages(agent_diff)
-        compile_ok = await self._cargo_check(sandbox_client, sandbox_id, packages)
+        compile_ok, compile_errors = await self._cargo_check(sandbox_client, sandbox_id, packages)
         compile_factor = 1.0 if compile_ok else self.COMPILE_FAIL_FACTOR
 
         # ---- optional judge (None offline → renormalize) ----
-        judge = await self._maybe_judge(state, agent_diff)
+        judge = await self._maybe_judge(state, agent_diff, compile_errors=compile_errors)
         if judge is None:
             total = self.W_STRUCT + self.W_STYLE
             quality = (self.W_STRUCT * structural + self.W_STYLE * style) / total
