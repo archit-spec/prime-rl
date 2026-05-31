@@ -81,9 +81,11 @@ alpha = 64
 mode = "full"
 
 [trainer.optim]
-# 1e-6 was very conservative — with small (normalized-advantage, LoRA) grad
-# norms the updates were micro. 5e-6 makes each step actually move the policy.
-lr = 5e-6
+# 1e-6 was very conservative. LoRA tolerates higher LR (low-rank adapter, and
+# alpha/rank=2 already scales it), and grad norms here are tiny, so 1e-5 keeps
+# the per-step update modest while actually moving the policy. Watch mismatch
+# KL / entropy after restart — dial back toward 5e-6 if it destabilizes.
+lr = 1e-5
 
 [inference]
 
