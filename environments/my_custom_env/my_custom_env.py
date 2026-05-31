@@ -54,6 +54,28 @@ from typing import Literal
 
 from datasets import Dataset
 
+
+def _load_dotenv() -> None:
+    """Load the project .env into os.environ (existing vars win) so the env
+    worker subprocess gets JUDGE_API_KEY etc. without relying on the launch
+    shell sourcing it. Dependency-free; runs once at import."""
+    for base in (Path.cwd(), *Path(__file__).resolve().parents):
+        envf = base / ".env"
+        if not envf.exists():
+            continue
+        for line in envf.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            if k and k not in os.environ:
+                os.environ[k] = v
+        return
+
+
+_load_dotenv()
+
 logger = logging.getLogger("hyperswitch_env")
 logger.setLevel(logging.INFO)
 logger.propagate = True
