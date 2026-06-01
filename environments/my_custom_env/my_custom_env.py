@@ -816,13 +816,23 @@ class HyperswitchRubric(vf.Rubric):
 {agent_diff}
 ```
 
-## Structural analysis (AST diff vs the reference solution; for context only)
+## How the patch compares to ONE reference solution (context only — NOT ground truth)
 {ast_summary}{compile_line}
+
+## Judging rules
+The reference is just ONE valid way to solve the task. Judge the patch against the
+TASK, not against the reference's shape:
+- A patch that fixes a DIFFERENT file/location, or uses a cleaner/better
+  ABSTRACTION than the reference, is **fully correct** — do NOT deduct for
+  diverging from the reference's files/items/symbols.
+- Only penalize a difference if it makes the patch actually wrong, incomplete, or
+  worse for the task. "Didn't match the reference" is NOT a defect by itself.
 
 ## Score 0-10 each
 - correctness: 0-1 won't build / inverted logic; 2-3 builds, core logic wrong;
   4-5 partially correct w/ a real bug; 6-7 mostly correct, edge cases off;
-  8-9 correct for all stated cases; 10 correct AND equivalent to reference.
+  8-9 correct for all stated cases; 10 fully correct (whether or not it matches
+  the reference's structure).
 - completeness: 0-1 none; 2-3 ≤25%; 4-5 ~50%; 6-7 ~75%; 8-9 75-99%; 10 all
   requirements addressed.
 
@@ -858,11 +868,19 @@ Return ONLY: {{"correctness":{{"score":<int>}},"completeness":{{"score":<int>}}}
 
         gi, ai = detail.get("gold_items", set()), detail.get("agent_items", set())
         gr, ar = detail.get("gold_refs", set()), detail.get("agent_refs", set())
+        # NEUTRAL framing — the reference is ONE valid solution, not ground truth.
+        # Do NOT phrase divergence as "missed" (that biases the judge to penalize
+        # correct-but-different / better-abstraction patches — the opposite of its
+        # job). Just state what each touched; the judge decides if a difference
+        # actually matters for the TASK.
         return (
-            f"- reference edits items: {short(gi)}\n"
-            f"- patch also edits:      {short(ai & gi)}  (matched)\n"
-            f"- reference items MISSED by patch: {short(gi - ai)}\n"
-            f"- symbols the reference uses but patch does NOT: {short(gr - ar)}"
+            f"- the reference solution touched: {short(gi)}\n"
+            f"- the patch and reference overlap on: {short(ai & gi)}\n"
+            f"- in the reference but not the patch: {short(gi - ai)} "
+            f"(may be irrelevant if the patch solves it a different/better way)\n"
+            f"- the patch edits these the reference didn't: {short(ai - gi)} "
+            f"(could be a better abstraction, or scope creep — your call)\n"
+            f"- symbols the reference used that the patch didn't: {short(gr - ar)}"
         )
 
     @staticmethod

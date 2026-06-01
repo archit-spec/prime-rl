@@ -53,6 +53,62 @@ The judge contributes **correctness + completeness** (its orthogonal value) at
   **Additive**, not a multiplicative gate. Skipped (and no credit) when the
   patch touches no crate code.
 
+> **Exactly what the two AST signals match (and don't):**
+> - **`location_f1`** maps each touched line to its **innermost enclosing item
+>   only** — *not* the full ancestor chain (mod→impl→fn) and *not* children. It
+>   covers **both edited and added** lines: `_old_side_touched_lines` records `-`
+>   (removed) lines *and* the base insertion point of `+` lines, all mapped on the
+>   base-file AST. So a deep in-body edit credits the enclosing `fn`, once.
+> - **`reference_f1`** reads **only `+` (added) lines**, to full AST depth (a
+>   chain `a.b.c.d()` → `b,c,d`). It does **not** read removed/edited-away lines —
+>   so a `bar()`→`baz()` change credits only `baz`. It's "what the new code uses,"
+>   ≈ the added code's used-symbols/children, not its parent scope.
+> - Net: the structural signal = *innermost parent (added+edited)* + *used-symbols
+>   to depth (added only)*.
+>
+> **These two scoping choices are deliberate — do NOT "fix" them:**
+> - *Innermost-only (no ancestor chain):* crediting the enclosing impl/mod would
+>   auto-match gold's module for *any* edit in the file → a free partial score that
+>   dilutes the signal. file_f1 already covers coarse file overlap; location must
+>   stay sharp ("same function," not "same module").
+> - *Reference on added lines only:* a correct fix is defined by the NEW behavior
+>   (the `+` symbols). Removed symbols are partly redundant with location ("you
+>   touched the same place") and add noise. Crediting `baz` not `bar` on a
+>   `bar()→baz()` edit is correct.
+> - *Revisit only if:* on edit-heavy (non-additive) tasks `reference_f1` proves too
+>   lenient (meaningful symbols were on `-` lines) — then add removed symbols at a
+>   reduced weight. Not before.
+
+### Crediting valid-but-different solutions (the gold-anchoring problem)
+
+The gold patch is **one** valid solution. A good patch can legitimately differ.
+Two cases, with a deliberate division of labor between the deterministic
+structural reward and the judge:
+
+- **Case A — same area, different specific item** (gold edits `fn handle` in
+  `impl Client`; patch edits a sibling method or refactors within `impl Client`).
+  Pure innermost-only `location_f1` scores this **0**, which is too harsh.
+  *Planned fix:* credit the **innermost item AND its type-level ancestor**
+  (`impl`/`struct`/`enum`/`trait`, but **not `mod`** — `file_f1` covers coarse
+  overlap), weighted so exact-item = full and shared-type-only = partial (~0.4).
+  Rewards "right abstraction level" without the dilution full-ancestor would cause.
+- **Case B — different location / better abstraction** (patch lifts the fix into a
+  shared trait in another module). No structural metric can credit this — by
+  definition it isn't where gold is. **This is the judge's job**, and it's *why*
+  the judge exists: structural = "did you match the known solution's shape";
+  judge = "is your different solution correct for the task."
+
+**The judge must NOT be gold-anchored.** The AST diagnosis we pass it is framed
+**neutrally** ("the reference touched X; the patch may correctly differ"), never
+"MISSED by patch" (which biased the judge to penalize divergence — the opposite of
+its purpose). The judge prompt explicitly instructs: *a patch that fixes a
+different file/location or uses a better abstraction is fully correct; only
+penalize a difference if it makes the patch wrong/incomplete/worse — "didn't match
+the reference" is not a defect.* And correctness 10 = "fully correct **whether or
+not it matches the reference's structure**" (was wrongly "equivalent to reference").
+This keeps structural (gold-similarity) and judge (gold-agnostic correctness) as
+the orthogonal signals they're meant to be.
+
 ---
 
 ## How we got here (the debugging story)
