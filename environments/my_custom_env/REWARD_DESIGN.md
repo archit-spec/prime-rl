@@ -228,3 +228,80 @@ original heartbeat-death root cause.
 - Reward verification ≠ "the numbers look sane" — we validated by **ranking the
   8 rollouts of one task** and confirming the genuinely-closer patch scored
   highest (`struct 0.76 @ 2/3 gold items` > `0.55 @ 1/3` > six `0.0` wrong-file).
+
+---
+
+## Change log — every knob we moved and why
+
+Configs live in `examples/my_custom_env/rl_hyperswitch.toml`; sandbox spec +
+reward + judge in `my_custom_env.py`; secrets in `.env` (gitignored).
+
+### Reward shape
+| Change | From → To | Why |
+|---|---|---|
+| Structural localization | difflib SequenceMatcher → **AST line-mapping** | text similarity punishes equivalent code; AST maps changed lines onto the full base-file tree |
+| AST signal | item set only → **0.5·location + 0.5·reference** | location = "right place", reference = "uses the right types/fields/methods" (catches stubs that don't wire anything up) |
+| Empty-gold guard | returned 1.0 → **None → fall back to file_f1** | killed the false 0.7/0.19 reward for editing wrong files |
+| Compile gate | **×0.25 multiplicative → +0.3 additive** | multiplicative squashed within-group variance 16× (killed the gradient); additive keeps quality variance at full scale |
+| Compile skip | always ran → **skip when no crate touched** | no point burning ~10min cargo on non-crate diffs |
+| Quality weights | 0.55/0.15/0.30 → **0.60 struct / 0.10 style / 0.30 judge** | structural is the reliable signal; style is weak; judge restored once reliable |
+
+### Judge
+| Change | Value | Why |
+|---|---|---|
+| Model/endpoint | **minimax-m2 @ grid.ai.juspay.net** | kimi reasoning models never emit JSON (burn all tokens thinking) — unusable |
+| Dimensions | 4 → **2 (correctness, completeness)** | the orthogonal axes; convention/hygiene duplicate style+structural |
+| Prompt | full gold diff → **compact AST diagnosis** | matched/missed items + missing symbols + compile status; far fewer tokens |
+| Reliability | + `response_format=json_object`, `seed=0`, `temp=0` | forces parseable JSON; temp 0 minimizes same-patch noise |
+| Concurrency | **Semaphore(5)** | grid hard-rejects >5 with HTTP 429 (verified) |
+| Cargo+judge | sequential → **`asyncio.gather` (concurrent)** | judge (~15-45s) hides under the ~10min cargo |
+| Key loading | **`.env` auto-loader at import** | judge was 401 — nothing loaded `.env` into the worker |
+
+### Trainer / infra
+| Change | From → To | Why |
+|---|---|---|
+| Attention | flash_attention_2 → **flash_attention_3** | ~74% higher trainer throughput at seq 102400 (MFU 22%→38%) |
+| Sandbox CPU | 4 → **64 cores** | cargo scoring was the throughput gate; host load was ~20% |
+| Sandbox mem | 16 → **128 GB** | headroom for 64 parallel rustc (avoid OOM-kill → false compile-fail) |
+| `disk_size_gb` | 20 → 100 | **NO-OP** — local docker client never passes it; real disk = `/var/lib/containerd` on `/` (~560G free) |
+| `max_inflight_rollouts` | 32 → **64** | run all rollouts/step concurrently → more inference in flight, less trainer idle |
+| Stale containers | — | clean up `r2e-rl-*` on client init + always `docker rm` by name in delete() |
+
+### Training dynamics
+| Change | From → To | Why |
+|---|---|---|
+| LR | 1e-6 → 5e-6 → **1e-4** | per-task reward dead flat at 1e-6/1e-5 *despite healthy advantages* — updates were sub-threshold; AdamW step ≈ LR, KL had headroom |
+| Rollout temperature | 0.7 → **1.0** | more within-group outcome diversity → more reward variance → bigger advantages; also finds the occasional standout success that drives learning |
+| `num_train_examples` | 256 → 8 → **32** | 8 was too small (per-step reward swung on which 4 tasks sampled, masking trend; overfit); 32 = diversity + cleaner signal at **no per-step cost** (still 4 tasks×8 rollouts/step) |
+| `max_steps` | 100 → **200** | SWE RL needs a long horizon |
+| `max_turns` | **80 (kept)** | deliberately not lowered |
+| System prompt | "reward 4× if compiles" → **real priorities** | stale after compile went additive; now: compile, edit right items + use right symbols (no stubs), then correctness |
+
+---
+
+## Diagnostics & how to read this run
+
+**Don't judge by loss or grad norm.** Loss ≈ 0 is the GRPO surrogate (meaningless).
+Grad norm ~0.003 is ~scale-invariant under normalized advantages + AdamW — it
+won't climb much regardless and isn't the signal.
+
+**Judge by per-task reward trend + leading indicators.** With 37 steps at LR 1e-5
+we confirmed:
+- within-group reward std **0.14, 0% zero-variance groups** → the advantage
+  signal is HEALTHY (reward engineering worked);
+- yet per-task reward was **dead flat** (Δ≈0 on all 8 tasks) → the limit was
+  **update magnitude (LR), not signal** → hence the jump to 1e-4.
+
+**How learning bootstraps (why temp matters):** temp=1.0 makes the 8 rollouts of
+a task explore widely; when one lands a genuinely good solution it's a standout
+→ large positive advantage → the policy is pulled toward it. Temp *finds* the
+success; LR lets the policy *move* to it.
+
+**Leading indicators that move before the blended reward:** compile pass-rate,
+`max_turns_reached` fraction (agent finishing more), file/AST F1. Watch these
+over 50–200 steps. SWE/agentic-coding reward is inherently slow & jagged — a flat
+early curve is normal; what's *not* acceptable is flat-at-1e-4 over ~50 steps
+with KL stable (→ then look at adapter rank / task difficulty / curriculum).
+
+**Abort/dial-back condition for LR 1e-4:** mismatch KL past ~0.05–0.1, or entropy
+spike→collapse, or reward crater → halve to 5e-5.
