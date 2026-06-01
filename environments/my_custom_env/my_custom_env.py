@@ -95,9 +95,13 @@ from verifiers.envs.experimental.sandbox_mixin import SandboxTimeouts
 # ── Curriculum System Prompts ──────────────────────────────────────────
 
 EXECUTION_DISCIPLINE = (
-    "EXECUTION DISCIPLINE — THE ONLY RULE THAT MATTERS:\n"
-    "YOUR REWARD IS MULTIPLIED BY 4x IF YOUR CODE COMPILES. A diff that compiles but is imperfect "
-    "scores 4x MORE than a perfect diff that does not compile. This is the single most important thing.\n\n"
+    "EXECUTION DISCIPLINE:\n"
+    "What you are scored on, in order:\n"
+    "1. Your change COMPILES (`cargo check` passes) — a building change is rewarded substantially "
+    "more than one that doesn't. An empty diff scores zero.\n"
+    "2. You edit the RIGHT code — the same functions, structs, impls and modules the task is about, "
+    "and you USE the right types/fields/methods (don't just add empty stubs or unused fields).\n"
+    "3. The change is CORRECT and COMPLETE for the task, and the diff is minimal and clean.\n\n"
     "MANDATORY WORKFLOW — follow this exactly:\n"
     "1. Explore for at most 2 turns (skim, don't audit).\n"
     "2. Make your first `edit` by turn 3 at the latest.\n"

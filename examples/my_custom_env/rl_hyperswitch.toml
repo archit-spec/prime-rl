@@ -36,7 +36,10 @@ temperature = 1.0
 id = "my-custom-env"
 
 [orchestrator.train.env.args]
-num_train_examples = 8
+# 8 was too small: each step samples 4 of them, so per-step reward swung on
+# WHICH tasks got picked (masking any learning trend) and risked overfitting.
+# 32 gives task diversity and a cleaner progress signal.
+num_train_examples = 32
 num_eval_examples = 32
 curriculum_level = 0
 # Env works end-to-end (vf-eval reward 0.127). Give the agent more turns now
@@ -81,11 +84,14 @@ alpha = 64
 mode = "full"
 
 [trainer.optim]
-# 1e-6 was very conservative. LoRA tolerates higher LR (low-rank adapter, and
-# alpha/rank=2 already scales it), and grad norms here are tiny, so 1e-5 keeps
-# the per-step update modest while actually moving the policy. Watch mismatch
-# KL / entropy after restart — dial back toward 5e-6 if it destabilizes.
-lr = 1e-5
+# At 1e-5 per-task reward stayed dead flat over 37 steps despite a HEALTHY
+# advantage signal (within-group reward std ~0.14, 0% zero-variance groups) —
+# the gradient was fine, the updates were just too small to move a 30B policy.
+# With AdamW the per-param step is ~LR and mismatch KL had huge headroom
+# (~0.012), so go aggressive: 1e-4 (10x). This is the upper edge for LoRA RL —
+# WATCH the first ~10 steps: if mismatch KL runs past ~0.05-0.1, or entropy
+# spikes then collapses, or reward craters, halve to 5e-5.
+lr = 1e-4
 
 [inference]
 
