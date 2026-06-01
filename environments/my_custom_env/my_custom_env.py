@@ -1138,6 +1138,25 @@ fi
                 f"{res.stderr or res.stdout}"
             )
 
+        # Recent-commits hint (findings_pr11372 §4.1 #1): the type/helper a fix
+        # needs was often introduced in a commit merged just before this task.
+        # Keep it SMALL — just ~10 commit subjects (~500 chars), not a file dump
+        # (the last commits across a 40-crate monorepo are mostly noise). For
+        # precision the agent is taught to run `git log -S '<symbol>' HEAD`
+        # on-demand. `git log HEAD` (==base_commit) shows only prior history, so
+        # no gold leakage; written outside WORKDIR so it never pollutes the diff.
+        brief_cmd = f"""
+cd {WORKDIR}
+{{
+  echo "Commits merged just before this task (base {base_commit[:10]}) — the type/helper";
+  echo "your fix needs may have been added in one. To find where a symbol was introduced:";
+  echo "  git log -S '<TypeOrFnName>' --oneline HEAD";
+  echo;
+  git log -10 --format='- %s' HEAD 2>/dev/null;
+}} > /tmp/recent_commits.md 2>/dev/null || true
+"""
+        await sandbox_client.execute_command(sandbox_id, brief_cmd, timeout=30)
+
 
 # ── Dataset Loaders ────────────────────────────────────────────────────
 

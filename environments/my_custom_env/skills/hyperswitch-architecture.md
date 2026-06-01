@@ -20,7 +20,7 @@ You are editing the `juspay/hyperswitch` Rust monorepo. It is huge (~30 crates, 
 
 3. **Request structs and request-construction sites are in different files.** A bug in a *request shape* lives in `types/`; a bug in a *callsite* lives in `core/`. Don't edit the callsite when the right fix is changing the struct. (See § Layer map.)
 
-4. **`git log -p $BASE_SHA -- <subsystem>` before grepping.** The most recently merged commit often introduced the exact type/helper you're about to reinvent. Specifically: look at the **immediately-preceding commit** on the base ref.
+4. **The type/helper you need was often added in a recent commit.** `/tmp/recent_commits.md` lists the last ~10 commit subjects before this task. To find where a specific symbol was introduced, run **`git log -S '<TypeOrFnName>' --oneline HEAD`** (and `git log --oneline -12 HEAD -- <subsystem>` for an area). The immediately-preceding commit is frequently the parent of this very PR.
 
 5. **`GlobalCustomerId` (v2) is globally unique by design.** `CustomerId` (v1) is unique only within a merchant. **Do not "fix" cross-merchant scoping on v2 paths** — there's nothing to fix; `GlobalCustomerId` already carries the scope.
 
@@ -91,6 +91,45 @@ Hyperswitch is mid-migration between two API surfaces. **Most domain types and m
 | Connector mapping | `crates/hyperswitch_connectors/src/connectors/<name>.rs` |
 
 **Trap from PR #11372:** the agent edited `payment_methods.rs` (v2 consumer) when the fix was at `cards.rs:628` (v1 request-construction callsite) AND `types/payment_methods.rs` (request struct definition). It picked the consumption site, not the construction site. **Construction sites are where bug fixes for "wrong value in field X" belong.**
+
+---
+
+## Connector tasks — the repo IS your connector reference
+
+~1 in 3 tasks edit a single connector. There are **130+ connectors** (exact count
+varies by the task's base commit) under
+`crates/hyperswitch_connectors/src/connectors/`, each with a fixed two-file layout:
+
+| File | Owns | Edit when the task is about… |
+|---|---|---|
+| `connectors/<name>.rs` | the `ConnectorIntegration` trait impls: auth, endpoints/URLs, headers, flow wiring, error mapping | auth, routing a new flow, endpoint/URL, status mapping |
+| `connectors/<name>/transformers.rs` | the request/response **structs** + their `TryFrom<…RouterData>` / `TryFrom<…Response>` mappings | **adding/changing a field, request shape, response parsing** (most connector tasks) |
+
+**Rule: do NOT look for external vendor API docs. Read a *sibling* connector's
+`transformers.rs` for the pattern.** Every connector follows the same shape, so
+"how do I add `transaction_code` to a request" or "how is Apple Pay decryption
+done" is answered by an existing connector that already does it:
+```
+rg -l "transaction_code|ApplePayDecrypt|wallet" crates/hyperswitch_connectors/src/connectors/*/transformers.rs
+```
+Pick the closest match, mirror its struct + `TryFrom` mapping.
+
+**Connector co-change:** adding a field to a request struct in `transformers.rs`
+almost always also requires updating the **`TryFrom<&XRouterData<…>> for XRequest`**
+impl in the *same* file to populate it (a declared-but-unset field is the #1
+connector antipattern — it looks done but wires nothing up).
+
+---
+
+## Co-change pairs — edit one, check the other
+
+| If you edit… | Also check… | Why |
+|---|---|---|
+| `connectors/<n>/transformers.rs` (struct field) | the `TryFrom` impl in the same file | populate the new field |
+| `core/payment_methods/cards.rs` (construction) | `types/payment_methods.rs` (struct def) | shape vs value |
+| `api_models/src/<area>.rs` (new API field) | `diesel_models/src/<area>.rs` + `schema.rs` | persistence |
+| `common_enums/src/enums.rs` (new variant) | every `match` on that enum (compiler will list them) | exhaustiveness |
+| any `#[cfg(feature = "v1")]` block | its `#[cfg(feature = "v2")]` sibling | the v1/v2 trap |
 
 ---
 
