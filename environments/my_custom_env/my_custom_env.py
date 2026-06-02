@@ -688,9 +688,15 @@ class HyperswitchRubric(vf.Rubric):
     W_JUDGE = 0.30
     # Additive compile term: this fraction of the reward is "does it build",
     # the rest is quality. Additive (not multiplicative) so structural variance
-    # survives — see class docstring.
-    COMPILE_WEIGHT = 0.3
-    CARGO_CHECK_TIMEOUT = 600
+    # survives — see class docstring. Lowered 0.3 -> 0.15: compiling a correct
+    # PARTIAL patch (toward a multi-file PR) standalone is genuinely hard, and
+    # even with the differential gate below the compile signal is the noisiest
+    # term, so it should nudge — not dominate — the reward.
+    COMPILE_WEIGHT = 0.15
+    # Differential gate runs cargo check twice per crate (patched + base); the
+    # base check is incremental/warm after the patched one (~1.3x cold), but
+    # give headroom so big crates don't time out into a spurious False.
+    CARGO_CHECK_TIMEOUT = 1200
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -778,20 +784,59 @@ class HyperswitchRubric(vf.Rubric):
                 pkgs.add(parts[1])
         return set(list(pkgs)[:3])
 
-    async def _cargo_check(self, client, sandbox_id, packages: set[str]) -> tuple[bool, str]:
-        """Returns (ok, errors) where errors is a concise compiler error summary (<500 chars)."""
+    @staticmethod
+    def _compile_feature(agent_diff: str) -> str:
+        """Pick the cfg feature to build under. hyperswitch crates are split on
+        `#[cfg(feature = "v1")]` / `"v2"`; building with NEITHER leaves the
+        dependency graph half-cfg'd-out (undeclared-module errors) AND excludes
+        the agent's edited lines from the build entirely (a broken edit inside a
+        v2 block would 'compile' vacuously). So we must build under one version.
+        v1 is the dominant path; switch to v2 only when the patch is clearly in
+        v2 territory."""
+        v1 = len(re.findall(r'feature\s*=\s*"v1"', agent_diff))
+        v2 = len(re.findall(r'feature\s*=\s*"v2"', agent_diff))
+        return "v2" if v2 > v1 else "v1"
+
+    async def _cargo_check(self, client, sandbox_id, packages: set[str], agent_diff: str) -> tuple[bool, str]:
+        """Differential, feature-aware compile gate. Returns (ok, errors).
+
+        `compile_ok` is True when the patch introduces NO NEW compile errors
+        relative to the base commit, checked under the same `--features <v1|v2>`.
+        This is robust to a base that doesn't cleanly build under default
+        features (the old `cargo check -p <pkg> --tests` gate, which flagged
+        every feature-gated crate as non-compiling regardless of patch quality):
+        we count errors patched-vs-base and only penalize a regression. We drop
+        `--tests` (test targets fail for reasons unrelated to the patch)."""
+        feature = self._compile_feature(agent_diff)
         for pkg in packages:
-            res = await client.execute_command(
-                sandbox_id,
-                f"cargo check -p {pkg} --tests 2>&1",
-                working_dir=WORKDIR,
-                timeout=self.CARGO_CHECK_TIMEOUT,
+            # One shell round-trip per crate: count errors with the patch
+            # applied (working tree), stash to the base commit, count again,
+            # restore. `-u` also stashes any new files the agent created.
+            script = (
+                f"cd {WORKDIR} && "
+                f'PATCHED=$(cargo check -p {pkg} --features {feature} 2>&1 | grep -cE "^error"); '
+                f'PERR=$(cargo check -p {pkg} --features {feature} 2>&1 | grep -E "^error" | head -8); '
+                f"git stash -u -q 2>/dev/null; "
+                f'BASE=$(cargo check -p {pkg} --features {feature} 2>&1 | grep -cE "^error"); '
+                f"git stash pop -q 2>/dev/null; "
+                f'echo "PATCHED=$PATCHED BASE=$BASE"; echo "$PERR"'
             )
-            if res.exit_code != 0:
-                # Extract just `error[...]` lines to keep it concise
-                lines = (res.stdout or res.stderr or "").splitlines()
-                error_lines = [l for l in lines if l.strip().startswith("error")][:8]
-                summary = "\n".join(error_lines)[:500]
+            res = await client.execute_command(
+                sandbox_id, script, working_dir=WORKDIR, timeout=self.CARGO_CHECK_TIMEOUT
+            )
+            out = res.stdout or res.stderr or ""
+            m = re.search(r"PATCHED=(\d+)\s+BASE=(\d+)", out)
+            if not m:
+                # Couldn't measure (timeout / harness error) — treat as no credit
+                # but don't claim a regression; surface the tail for the judge.
+                return False, out.strip()[-500:]
+            patched_errs, base_errs = int(m.group(1)), int(m.group(2))
+            if patched_errs > base_errs:
+                error_lines = [l for l in out.splitlines() if l.strip().startswith("error")][:8]
+                summary = (
+                    f"patch adds {patched_errs - base_errs} new compile error(s) "
+                    f"(feature={feature}): " + " | ".join(error_lines)
+                )[:500]
                 return False, summary
         return True, ""
 
@@ -1056,7 +1101,7 @@ Return ONLY: {{"correctness":{{"score":<int>}},"completeness":{{"score":<int>}}}
         packages = self._touched_packages(agent_diff)
         if packages:
             (compile_ok, compile_errors), judge = await asyncio.gather(
-                self._cargo_check(sandbox_client, sandbox_id, packages),
+                self._cargo_check(sandbox_client, sandbox_id, packages, agent_diff),
                 self._maybe_judge(state, agent_diff, ast_detail=ast_detail),
             )
         else:
