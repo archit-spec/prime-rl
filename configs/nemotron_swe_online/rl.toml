@@ -1,0 +1,122 @@
+# Online (async) GRPO on agentic SWE tasks with Nemotron-3-Nano-30B,
+# using LOCAL Docker sandboxes (no paid Prime Intellect sandbox API).
+#
+# This is the online counterpart to the offline reinforce/Polar rig:
+# orchestrator generates rollouts on the inference fleet -> trainer GRPO step ->
+# weights broadcast back to inference (NCCL) -> next rollouts come from the
+# updated policy. Curriculum is emergent via the buffer thresholds below.
+#
+# LOCAL SANDBOX: launch via scripts that first `enable_local_sandbox()` (see
+# local_sandbox/install_local_sandbox.py) or set PRIME_RL_LOCAL_SANDBOX=1, which
+# monkeypatches verifiers' SandboxEnv to LocalDockerSandboxClient. Each rollout
+# then runs in a local container (`docker run` of the per-task SWE image) instead
+# of calling api.primeintellect.ai. Reuses the SWE-Gym images we already built.
+#
+# Single 8xH200 node: GPUs are SPLIT (unlike offline) because inference + trainer
+# run simultaneously. Default below: 4 inference / 4 train.
+#
+# NOTE on dataset: this points at PrimeIntellect/SWE-Bench-Verified-Quick, which
+# the env's swebench harness supports natively. Running SkyRL-293 (SWE-Gym)
+# instead needs the swegym fork wired into the env's grading (same swebench-
+# version gap we solved for Polar) — see configs/nemotron_swe_online/README.
+
+max_steps = 8          # short first online run (proves the loop turns)
+seq_len = 4096         # small for memory (LoRA on 30B, 4 trainer GPUs)
+clean_output_dir = true  # don't resume a stale materialized config
+
+[deployment]
+type = "single_node"   # local: inference on first GPUs, trainer on the rest
+num_infer_gpus = 4     # GPUs 0-3 -> vLLM (tp=4)
+num_train_gpus = 4     # GPUs 4-7 -> FSDP trainer (ep=4)
+
+[model]
+name = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+
+# LoRA requires filesystem weight broadcast (NCCL doesn't support LoRA yet).
+# Set directly on each sub-config to avoid the top-level nccl default.
+[trainer.weight_broadcast]
+type = "filesystem"
+
+[orchestrator.weight_broadcast]
+type = "filesystem"
+
+[inference.weight_broadcast]
+type = "filesystem"
+
+[wandb]
+project = "nemotron-swe-online"
+name = "nemotron-30b-swe-local-sandbox"
+
+[ckpt]
+interval = 50
+
+[orchestrator]
+batch_size = 8
+rollouts_per_example = 4     # GRPO group size (needs variance -> see buffer)
+max_off_policy_steps = 4     # async: inference may lag trainer by <=4 steps
+
+[orchestrator.model.lora]
+name = "nemotron-swe-lora"   # adapter name inference loads / trainer broadcasts
+
+[orchestrator.train.sampling]
+max_completion_tokens = 2048
+
+# --- the SWE env with LOCAL sandboxes ---
+[[orchestrator.train.env]]
+id = "mini-swe-agent-plus"
+name = "swe"
+args = { dataset_name = "PrimeIntellect/SWE-Bench-Verified-Quick", max_turns = 50, cpu_cores = 2, memory_gb = 4, disk_size_gb = 4, total_timeout_minutes = 30, sandbox_client_max_workers = 32, max_command_timeouts = 3, sandbox_command_timeout = 30, allow_git = true }
+
+# --- CURRICULUM: learnability filter (drop zero-gradient groups) ---
+# Online makes this a moving frontier: all-solved tasks saturate out (mean>=1.0),
+# all-failed re-enter as the policy improves and they start landing partial wins.
+[orchestrator.buffer]
+easy_threshold = 1.0    # drop groups with mean reward >= 1.0 (no signal)
+hard_threshold = 0.0    # drop groups with mean reward <= 0.0 (no signal)
+seed = 42
+
+[orchestrator.eval]
+interval = 50
+
+[[orchestrator.eval.env]]
+id = "mini-swe-agent-plus"
+name = "swe-bench-verified-quick"
+args = { dataset_name = "PrimeIntellect/SWE-Bench-Verified-Quick", max_turns = 50, cpu_cores = 2, memory_gb = 4, disk_size_gb = 4, total_timeout_minutes = 30, sandbox_client_max_workers = 32, max_command_timeouts = 3, sandbox_command_timeout = 30, allow_git = true }
+
+# NOTE: prime-rl's custom nemotron_h impl assumes gated experts (w1/w2/w3),
+# but Nano-30B uses non-gated experts (up_proj/down_proj) -> custom impl fails
+# to load. Use impl="hf" (transformers native, which DOES support Nano-30B).
+[trainer.model]
+impl = "hf"
+attn = "flash_attention_2"
+optim_cpu_offload = true
+
+[trainer.model.ac]
+freq = 1
+
+[trainer.model.ac_offloading]
+max_inflight_activations = 5
+
+# LoRA only (no full FT). Attention-only targets: under impl="hf" the MoE
+# experts are nn.Parameter (not LoRA-able), so we LoRA q/k/v/o_proj — exactly
+# the reinforce rig's proven v12 attn-only recipe. rl.py auto-enables
+# inference LoRA + sets max_lora_rank to match.
+[trainer.model.lora]
+rank = 16
+alpha = 32
+target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+[trainer.ckpt.weights]
+save_adapter_separately = true
+
+[trainer.optim]
+type = "adamw"
+lr = 1e-6
+
+# --- GPU split on a single 8xH200 node: 4 inference / 4 train ---
+[inference.parallel]
+tp = 4
+dp = 1
+
+[inference.model]
+max_model_len = 32768

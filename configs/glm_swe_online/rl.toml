@@ -1,0 +1,89 @@
+# Online (async) GRPO on agentic SWE tasks (swebench-graded, NO judge) with
+# GLM-4.7-Flash, using LOCAL Docker sandboxes. Memory recipe adapted from the
+# proven examples/my_custom_env/rl_hyperswitch.toml (LoRA + fused chunked LM
+# head + cp=1 + fp8 KV) — GLM-4.7-Flash's 154880 vocab OOMs a vanilla LM head.
+#
+# LOCAL SANDBOX: launch via scripts/run_swe_online_local.sh (PRIME_RL_LOCAL_SANDBOX=1
+# -> sitecustomize monkeypatches verifiers' SandboxEnv to LocalDockerSandboxClient).
+# Reward is swebench test-suite resolution (deterministic), so no judge/API key.
+
+max_steps = 200
+seq_len = 81920          # ~80k: room for full multi-turn SWE traces (no truncation drops)
+clean_output_dir = true
+
+[deployment]
+type = "single_node"
+num_infer_gpus = 4
+num_train_gpus = 4
+
+[model]
+name = "zai-org/GLM-4.7-Flash"
+
+[wandb]
+project = "glm-swe-online"
+name = "glm47-flash-swe-local-sandbox"
+
+[ckpt]
+interval = 50
+
+[orchestrator]
+batch_size = 8
+rollouts_per_example = 4
+max_off_policy_steps = 4
+
+[orchestrator.train.sampling]
+max_completion_tokens = 2048
+temperature = 1.0
+
+# SWE env (swebench-graded, deterministic) with LOCAL sandboxes
+[[orchestrator.train.env]]
+id = "skyrl-swe"
+name = "swe"
+args = { dataset_name = "PrimeIntellect/SWE-Bench-Verified-Quick", max_turns = 40, cpu_cores = 2, memory_gb = 4, disk_size_gb = 4, total_timeout_minutes = 30, sandbox_client_max_workers = 32, max_command_timeouts = 3, sandbox_command_timeout = 30, allow_git = true }
+
+# CURRICULUM: drop zero-variance (zero-gradient) groups
+[orchestrator.buffer]
+easy_threshold = 1.0
+hard_threshold = 0.0
+seed = 42
+
+[orchestrator.eval]
+interval = 50
+
+[[orchestrator.eval.env]]
+id = "skyrl-swe"
+name = "swe-bench-verified-quick"
+num_examples = 30
+args = { dataset_name = "PrimeIntellect/SWE-Bench-Verified-Quick", max_turns = 40, cpu_cores = 2, memory_gb = 4, disk_size_gb = 4, total_timeout_minutes = 30, sandbox_client_max_workers = 32, max_command_timeouts = 3, sandbox_command_timeout = 30, allow_git = true }
+
+# --- proven GLM-4.7-Flash trainer recipe (from rl_hyperswitch.toml) ---
+[trainer.model]
+impl = "auto"                 # glm4_moe_lite -> HF path
+attn = "flash_attention_2"    # FA3 not installed here; FA2 ok for SWE context
+optimization_dtype = "bfloat16"
+reduce_dtype = "bfloat16"
+cp = 1                        # dp_shard auto-resolves to 4 (shard across train GPUs)
+# Chunked LM head: peak logits = chunk*vocab, not seq*vocab -> the GLM vocab OOM fix
+fused_lm_head_token_chunk_size = "auto"
+
+# LoRA (not full FT): ~74 GB/GPU saved -> filesystem weight broadcast (LoRA-compatible)
+[trainer.model.lora]
+rank = 32
+alpha = 64
+
+[trainer.model.ac]
+mode = "full"
+
+[trainer.optim]
+type = "adamw"
+lr = 1e-4
+
+[inference.parallel]
+tp = 4
+
+[inference.model]
+max_model_len = 81920    # match seq_len so agent traces fit what the trainer keeps
+dtype = "bfloat16"
+
+[inference.vllm_extra]
+kv_cache_dtype = "fp8"

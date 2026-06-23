@@ -81,7 +81,7 @@ SHUTDOWN_TIMEOUT_S = 300
 # Maximum number of times to attempt generating a training batch when all
 # rollouts are filtered out. After this many attempts, the orchestrator crashes
 # rather than silently skipping training steps.
-MAX_EMPTY_BATCH_ATTEMPTS = 3
+MAX_EMPTY_BATCH_ATTEMPTS = 10
 
 
 @clean_exit
